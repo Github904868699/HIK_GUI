@@ -54,6 +54,7 @@ UI_PAINT_FPS = 12.0
 CAMERA_INIT_FPS = 5.0
 CAM_THROUGHPUT_MBPS = 80
 GIGE_PACKET_DELAY = 8000
+RESULT_BASE_ADDR = 1  # 对应保持寄存器 40002
 
 APP_TITLE = "HIK MVS"
 APP_ICON  = "Camera.ico"
@@ -612,6 +613,7 @@ class MainWindow(QtWidgets.QWidget):
         self.modbus_model = ModbusRegisterModel(size=16)
         self.modbus_server = None
         self.modbus_error: str | None = None
+        self._last_result_count = 0
         try:
             self.modbus_server = start_modbus_server(
                 self.modbus_host, self.modbus_port, self.modbus_model, on_write=self._on_modbus_write
@@ -791,7 +793,7 @@ class MainWindow(QtWidgets.QWidget):
         if model:
             if manual:
                 model.set_register(0, 1)
-            model.set_register(1, 0)
+            self._publish_modbus_result([])
         self.recognize_once()
         if model:
             model.set_register(0, 0)
@@ -804,9 +806,21 @@ class MainWindow(QtWidgets.QWidget):
     def trigger_manual_recognition(self):
         self._handle_recognition_request(manual=True)
 
-    def _publish_modbus_result(self, value: int):
-        if getattr(self, "modbus_model", None):
-            self.modbus_model.set_register(1, value & 0xFFFF)
+    def _publish_modbus_result(self, values):
+        model = getattr(self, "modbus_model", None)
+        if not model:
+            return
+        if isinstance(values, int):
+            values_list = [values]
+        else:
+            values_list = list(values)
+        if not values_list:
+            values_list = [0]
+        sanitized = [int(v) & 0xFFFF for v in values_list]
+        if self._last_result_count > len(sanitized):
+            sanitized.extend([0] * (self._last_result_count - len(sanitized)))
+        model.write(RESULT_BASE_ADDR, sanitized)
+        self._last_result_count = len(sanitized)
 
     @QtCore.pyqtSlot(np.ndarray)
     def on_frame_from_hik(self, frame_bgr: np.ndarray):
@@ -866,21 +880,20 @@ class MainWindow(QtWidgets.QWidget):
                 x, y, r, _ = max(cands, key=lambda t: t[3])
                 cv2.circle(img, (int(x), int(y)), int(r), (0, 215, 255), 2)
                 labels.append(("金色-圆形", (int(x - r), int(y - r - 6)), QtGui.QColor(255, 215, 0)))
-        result_value = 0
+        result_values: List[int] = []
         if labels:
             self.msg_label.setText("\n".join([t for t,_,_ in labels]))
             self.msg_timer.start(2000)
             for text, *_ in labels:
                 code = self.result_codes.get(text)
                 if code is not None:
-                    result_value = int(code)
-                    break
-            if result_value == 0:
+                    result_values.append(int(code))
+            if not result_values:
                 print("[识别] 未找到匹配的结果编码，保持 0")
         else:
             print("[识别] 未检测到目标")
             self.msg_label.setText("")
-        self._publish_modbus_result(result_value)
+        self._publish_modbus_result(result_values)
 
     def toggle_mask(self, name: str):
         if name in self.mask_windows and self.mask_windows[name].isVisible():
