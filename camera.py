@@ -707,7 +707,7 @@ class MainWindow(QtWidgets.QWidget):
         form.addRow("端口:", self.modbus_port_label)
         form.addRow("状态:", self.modbus_status_lbl)
         self.recognize_btn = QtWidgets.QPushButton("手动识别")
-        self.recognize_btn.clicked.connect(self.recognize_once)
+        self.recognize_btn.clicked.connect(self.trigger_manual_recognition)
         form.addRow(self.recognize_btn)
         vbox.addWidget(g_modbus)
         vbox.addStretch(1)
@@ -786,11 +786,23 @@ class MainWindow(QtWidgets.QWidget):
             print("[MODBUS] 收到拍照请求")
             self.modbus_trigger_sig.emit()
 
+    def _handle_recognition_request(self, manual: bool = False):
+        model = getattr(self, "modbus_model", None)
+        if model:
+            if manual:
+                model.set_register(0, 1)
+            model.set_register(1, 0)
+        self.recognize_once()
+        if model:
+            model.set_register(0, 0)
+
     @QtCore.pyqtSlot()
     def _on_modbus_trigger(self):
-        self.modbus_model.set_register(1, 0)
-        self.recognize_once()
-        self.modbus_model.set_register(0, 0)
+        self._handle_recognition_request(manual=False)
+
+    @QtCore.pyqtSlot()
+    def trigger_manual_recognition(self):
+        self._handle_recognition_request(manual=True)
 
     def _publish_modbus_result(self, value: int):
         if getattr(self, "modbus_model", None):
