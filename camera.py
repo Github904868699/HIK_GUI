@@ -3,57 +3,18 @@ import os, sys
 from pathlib import Path
 import struct
 
-def add_mvs_runtime_from_system():
-    # 常见安装位置（64 位）
-    candidates = [
-        Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"),
-        Path(r"C:\Program Files\Common Files\MVS\Runtime\Win64_x64"),
-    ]
-    for p in candidates:
-        if p.exists():
-            # Python 3.8+ 正确做法：把目录加入本进程 DLL 搜索路径
-            if hasattr(os, "add_dll_directory"):
-                os.add_dll_directory(str(p))   # 影响本进程的 DLL 搜索
-            # 兜底再拼到 PATH（部分三方仍依赖）
-            os.environ["PATH"] = str(p) + os.pathsep + os.environ.get("PATH", "")
-            return True
-    return False
-
-if getattr(sys, "frozen", False):
-    add_mvs_runtime_from_system()
-
-
-from MvCameraControl_class import *  # 或你的实际导入
-
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
 import cv2
-import ctypes, json, socket, socketserver, threading, time
-from MvCameraControl_class import (
-    MvCamera,
-    MV_CC_DEVICE_INFO_LIST, MV_CC_DEVICE_INFO,
-    MVCC_INTVALUE, MVCC_ENUMVALUE, MV_FRAME_OUT_INFO_EX,
-    MV_CC_PIXEL_CONVERT_PARAM,
-)
-import MvCameraControl_class as mv
-from CameraParams_header import *
-from PixelType_header import *
-
-MV_ACCESS_EXCLUSIVE       = getattr(mv, "MV_ACCESS_Exclusive", 1)
-MV_GIGE_DEVICE_SAFE       = getattr(mv, "MV_GIGE_DEVICE", 1)
-MV_TRIGGER_MODE_OFF_SAFE  = getattr(mv, "MV_TRIGGER_MODE_OFF", 0)
-MV_TRIGGER_MODE_ON_SAFE   = getattr(mv, "MV_TRIGGER_MODE_ON", 1)
+import json, socket, socketserver, threading, time
 
 CONFIG_PATH = "config.json"
 TARGET_DISPLAY_WIDTH = 1280
 UI_TARGET_FPS = 15.0
 UI_PAINT_FPS = 12.0
-CAMERA_INIT_FPS = 5.0
-CAM_THROUGHPUT_MBPS = 80
-GIGE_PACKET_DELAY = 8000
 RESULT_BASE_ADDR = 1  # 对应保持寄存器 40002
 
 APP_TITLE = "HIK MVS"
@@ -428,169 +389,83 @@ def detect_shapes(frame_bgr: np.ndarray, color_cfgs: List['ColorCfg'], enabled_g
             labels.append((label_txt, tpos, qcolor))
     return labels
 
-def _get_i32(cam, key):
-    st = MVCC_INTVALUE()
-    if cam.MV_CC_GetIntValue(key, st) != 0: raise RuntimeError(f"Get {key} 失败")
-    return st.nCurValue
-
-def _get_enum(cam, key):
-    st = MVCC_ENUMVALUE()
-    if cam.MV_CC_GetEnumValue(key, st) != 0: raise RuntimeError(f"Get {key} 失败")
-    return st.nCurValue
-
-def _set_int(cam, key, val):
-    try: return cam.MV_CC_SetIntValue(key, int(val))
-    except Exception: return -1
-
-def _set_float(cam, key, val):
-    try: return cam.MV_CC_SetFloatValue(key, float(val))
-    except Exception: return -1
-
-def _set_enum(cam, key, val):
-    try: return cam.MV_CC_SetEnumValue(key, int(val))
-    except Exception: return -1
-
-def open_first_gige():
-    dev_list = MV_CC_DEVICE_INFO_LIST()
-    if MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE_SAFE, dev_list) != 0 or dev_list.nDeviceNum == 0:
-        raise RuntimeError("未发现 GigE 相机")
-    cam = MvCamera()
-    dev_info = ctypes.cast(dev_list.pDeviceInfo[0], ctypes.POINTER(MV_CC_DEVICE_INFO)).contents
-    if cam.MV_CC_CreateHandle(dev_info) != 0:
-        raise RuntimeError("CreateHandle 失败")
-    if cam.MV_CC_OpenDevice(MV_ACCESS_EXCLUSIVE, 0) != 0:
-        cam.MV_CC_DestroyHandle(); raise RuntimeError("OpenDevice 失败")
-
-    cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF_SAFE)
-    try:
-        cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
-        _set_float(cam, "AcquisitionFrameRate", CAMERA_INIT_FPS)
-    except Exception:
-        pass
-    try:
-        _set_int(cam, "GevSCPD", GIGE_PACKET_DELAY)
-        _set_int(cam, "GevSCPBandwidth", CAM_THROUGHPUT_MBPS*1024*1024)
-    except Exception:
-        pass
-    return cam
-
-def _reshape_with_stride(raw_view, h, w, pix_type, nbytes):
-    arr = np.frombuffer(raw_view, dtype=np.uint8)[:nbytes]
-    return arr
-
-_BAYER_CODE = {
-    PixelType_Gvsp_BayerRG8: cv2.COLOR_BayerRG2BGR,
-    PixelType_Gvsp_BayerBG8: cv2.COLOR_BayerBG2BGR,
-    PixelType_Gvsp_BayerGB8: cv2.COLOR_BayerGB2BGR,
-    PixelType_Gvsp_BayerGR8: cv2.COLOR_BayerGR2BGR,
-}
-
-def _shift_bayer_tag(base_tag, ox, oy):
-    lut = {
-        PixelType_Gvsp_BayerRG8: (PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerBG8),
-        PixelType_Gvsp_BayerGR8: (PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerBG8, PixelType_Gvsp_BayerGB8),
-        PixelType_Gvsp_BayerGB8: (PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerBG8, PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerGR8),
-        PixelType_Gvsp_BayerBG8: (PixelType_Gvsp_BayerBG8, PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerRG8),
-    }
-    idx = ((oy & 1) << 1) | (ox & 1)
-    return lut.get(base_tag, (base_tag,)*4)[idx]
-
-class HikGrabber(QtCore.QThread):
+class UsbGrabber(QtCore.QThread):
     frameSignal = QtCore.pyqtSignal(np.ndarray)
     infoSignal  = QtCore.pyqtSignal(str)
-    def __init__(self, parent=None):
+
+    def __init__(self, parent=None, index: int = 0):
         super().__init__(parent)
-        self.cam = None
+        self.index = index
+        self.cap: Optional[cv2.VideoCapture] = None
         self._running = False
         self._last_emit_ts = 0.0
+
     def run(self):
         try:
-            self.cam = open_first_gige()
-            width  = _get_i32(self.cam, "Width")
-            height = _get_i32(self.cam, "Height")
-            pix    = _get_enum(self.cam, "PixelFormat")
-            self.infoSignal.emit(f"[INFO] {width}x{height}")  # 不显示 PixelFormat
-            if self.cam.MV_CC_StartGrabbing() != 0:
-                raise RuntimeError("StartGrabbing 失败")
-            pl = MVCC_INTVALUE(); self.cam.MV_CC_GetIntValue("PayloadSize", pl)
-            in_size = int(pl.nCurValue if pl.nCurValue > 0 else width*height*3)
-            buf = (ctypes.c_ubyte * in_size)()
-            frame_info = MV_FRAME_OUT_INFO_EX()
+            if os.name == "nt":
+                backend = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+            else:
+                backend = cv2.CAP_ANY
+            self.cap = cv2.VideoCapture(self.index, backend)
+            if (not self.cap or not self.cap.isOpened()) and backend != cv2.CAP_ANY:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = cv2.VideoCapture(self.index)
+            if not self.cap or not self.cap.isOpened():
+                raise RuntimeError("无法打开 USB 摄像头")
+
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if width > 0 and height > 0:
+                self.infoSignal.emit(f"[INFO] {width}x{height}")
+            else:
+                self.infoSignal.emit("[INFO] USB Camera")
+
             self._running = True
-            t0 = time.time(); grabbed = 0
+            t0 = time.time()
+            grabbed = 0
             while self._running:
-                nret = self.cam.MV_CC_GetOneFrameTimeout(buf, in_size, frame_info, 1000)
-                if nret != 0: continue
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    QtCore.QThread.msleep(5)
+                    continue
                 grabbed += 1
-                w, h = frame_info.nWidth, frame_info.nHeight
-                raw = memoryview(buf)[:frame_info.nFrameLen]
-                pt  = frame_info.enPixelType
-                # 1) SDK 转 BGR8
-                out_size = w*h*3
-                out_buf  = (ctypes.c_ubyte * out_size)()
-                cvt = MV_CC_PIXEL_CONVERT_PARAM()
-                cvt.nWidth  = w; cvt.nHeight = h
-                cvt.enSrcPixelType = pt
-                cvt.enDstPixelType = PixelType_Gvsp_BGR8_Packed
-                cvt.pSrcData = buf
-                cvt.nSrcDataLen = frame_info.nFrameLen
-                cvt.pDstBuffer = out_buf
-                cvt.nDstBufferSize = out_size
-                ret2 = self.cam.MV_CC_ConvertPixelType(cvt)
-                if ret2 == 0:
-                    img = np.frombuffer(out_buf, dtype=np.uint8)[: out_size].reshape(h, w, 3)
-                else:
-                    plane = _reshape_with_stride(raw, h, w, pt, frame_info.nFrameLen)
-                    if pt == PixelType_Gvsp_Mono8:
-                        gray = plane.reshape(h, w)
-                        img  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                    elif pt in (PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerBG8,
-                                PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerGR8):
-                        base = pt
-                        try:
-                            ox = _get_i32(self.cam, "OffsetX")
-                            oy = _get_i32(self.cam, "OffsetY")
-                        except Exception:
-                            ox = oy = 0
-                        tag = _shift_bayer_tag(base, ox, oy)
-                        bayer = plane.reshape(h, w)
-                        img   = cv2.cvtColor(bayer, _BAYER_CODE.get(tag, cv2.COLOR_BayerRG2BGR))
-                    elif pt == PixelType_Gvsp_RGB8_Packed:
-                        rgb = plane.reshape(h, w, 3)
-                        img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                    elif pt == PixelType_Gvsp_BGR8_Packed:
-                        img = plane.reshape(h, w, 3)
-                    else:
-                        gray = plane.reshape(h, -1)[:, :w]
-                        img  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                if img.shape[1] > TARGET_DISPLAY_WIDTH:
-                    scale = TARGET_DISPLAY_WIDTH / float(img.shape[1])
-                    img = cv2.resize(img, (TARGET_DISPLAY_WIDTH, int(img.shape[0]*scale)), interpolation=cv2.INTER_AREA)
+                if frame.shape[1] > TARGET_DISPLAY_WIDTH:
+                    scale = TARGET_DISPLAY_WIDTH / float(frame.shape[1])
+                    frame = cv2.resize(frame, (TARGET_DISPLAY_WIDTH, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+
                 now_ts = time.time()
                 if (now_ts - self._last_emit_ts) < (1.0 / UI_TARGET_FPS):
+                    QtCore.QThread.msleep(5)
                     continue
+
                 self._last_emit_ts = now_ts
-                self.frameSignal.emit(img)
+                self.frameSignal.emit(frame.copy())
+
                 now = time.time()
                 if now - t0 >= 1.0:
-                    self.infoSignal.emit(f"[FPS] {grabbed/(now-t0):.1f}")
-                    t0 = now; grabbed = 0
+                    self.infoSignal.emit(f"[FPS] {grabbed / (now - t0):.1f}")
+                    t0 = now
+                    grabbed = 0
+
+                QtCore.QThread.msleep(1)
         except Exception as e:
-            self.infoSignal.emit(f"[HIK] 取流异常: {e}")
+            self.infoSignal.emit(f"[USB] 取流异常: {e}")
         finally:
             self._stop_and_close()
-    def stop(self): self._running = False
+
+    def stop(self):
+        self._running = False
+
     def _stop_and_close(self):
-        try:
-            if self.cam:
-                try: self.cam.MV_CC_StopGrabbing()
-                except Exception: pass
-                try: self.cam.MV_CC_CloseDevice()
-                except Exception: pass
-                try: self.cam.MV_CC_DestroyHandle()
-                except Exception: pass
-        finally:
-            self.cam = None
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = None
 
 class MainWindow(QtWidgets.QWidget):
     modbus_trigger_sig = QtCore.pyqtSignal()
@@ -678,7 +553,7 @@ class MainWindow(QtWidgets.QWidget):
         self._init_controls()
         self._update_modbus_status()
 
-        self.grabber = HikGrabber(self)
+        self.grabber = UsbGrabber(self)
         self.grabber.frameSignal.connect(self.on_frame_from_hik)
         self.grabber.infoSignal.connect(self.on_info)
         self.grabber.start()
@@ -775,7 +650,7 @@ class MainWindow(QtWidgets.QWidget):
     def reopen_camera(self):
         if getattr(self, "grabber", None) and self.grabber.isRunning():
             self.grabber.stop(); self.grabber.wait(1000)
-        self.grabber = HikGrabber(self)
+        self.grabber = UsbGrabber(self)
         self.grabber.frameSignal.connect(self.on_frame_from_hik)
         self.grabber.infoSignal.connect(self.on_info)
         self.grabber.start()
@@ -919,7 +794,7 @@ class MainWindow(QtWidgets.QWidget):
     def reopen_camera(self):
         if getattr(self, "grabber", None) and self.grabber.isRunning():
             self.grabber.stop(); self.grabber.wait(1000)
-        self.grabber = HikGrabber(self)
+        self.grabber = UsbGrabber(self)
         self.grabber.frameSignal.connect(self.on_frame_from_hik)
         self.grabber.infoSignal.connect(self.on_info)
         self.grabber.start()
