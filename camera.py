@@ -31,7 +31,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
 import cv2
-import ctypes, json, socketserver, threading, time
+import ctypes, json, socket, socketserver, threading, time
 from MvCameraControl_class import (
     MvCamera,
     MV_CC_DEVICE_INFO_LIST, MV_CC_DEVICE_INFO,
@@ -91,19 +91,31 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     cfg = safe_load_json(path, default=None)
     if not cfg:
         cfg = {
-            "server": {"host": "192.168.0.55", "port": 502},
+            "server": {"host": "0.0.0.0", "port": 502},
             "cmd_map": {
             },
             "colors": [
-                
+
             ]
         }
     if isinstance(cfg, list):
-        cfg = {"server": {"host":"192.168.0.55","port":502}, "cmd_map": {}, "colors": cfg}
-    cfg.setdefault("server", {"host": "192.168.0.55", "port": 502})
+        cfg = {"server": {"host":"0.0.0.0","port":502}, "cmd_map": {}, "colors": cfg}
+    cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("cmd_map", {})
     cfg.setdefault("colors", [])
     return cfg
+
+
+def get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
 
 @dataclass
 class ColorCfg:
@@ -141,27 +153,41 @@ def colors_from_config(cfg: dict) -> List[ColorCfg]:
         ))
     return colors
 
+def _parse_cmd_code(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped, 0)
+        except ValueError:
+            return None
+    return None
+
+
 def result_codes_from_cmd_map(cmd_map: dict) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for label, value in cmd_map.items():
-        if isinstance(value, int):
-            out[label] = value
+        code = _parse_cmd_code(value)
+        if code is not None:
+            out[label] = code
             continue
+        parsed = None
         if isinstance(value, str):
             stripped = value.strip()
-            if stripped.isdigit():
-                out[label] = int(stripped)
-                continue
-            try:
-                parsed = json.loads(stripped)
-            except Exception:
-                print(f"[MODBUS] 忽略无法解析的 cmd_map 项: {label}")
-                continue
-        else:
-            parsed = value if isinstance(value, dict) else None
+            if stripped:
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    print(f"[MODBUS] 忽略无法解析的 cmd_map 项: {label}")
+                    continue
+        elif isinstance(value, dict):
+            parsed = value
         if isinstance(parsed, dict):
-            code = parsed.get("code")
-            if isinstance(code, int):
+            code = _parse_cmd_code(parsed.get("code"))
+            if code is not None:
                 out[label] = code
             else:
                 print(f"[MODBUS] cmd_map 项 {label} 缺少 'code' 数值，已忽略")
@@ -581,7 +607,7 @@ class MainWindow(QtWidgets.QWidget):
         self._last_paint_ts = 0.0
 
         svr = self.config.get("server", {})
-        self.modbus_host = str(svr.get("host", "192.168.0.55"))
+        self.modbus_host = str(svr.get("host", "0.0.0.0") or "0.0.0.0")
         self.modbus_port = int(svr.get("port", 502))
         self.modbus_model = ModbusRegisterModel(size=16)
         self.modbus_server = None
@@ -674,7 +700,7 @@ class MainWindow(QtWidgets.QWidget):
 
         g_modbus = QtWidgets.QGroupBox("Modbus")
         form = QtWidgets.QFormLayout(g_modbus)
-        self.modbus_ip_label = QtWidgets.QLabel(self.modbus_host)
+        self.modbus_ip_label = QtWidgets.QLabel("--")
         self.modbus_port_label = QtWidgets.QLabel(str(self.modbus_port))
         self.modbus_status_lbl = QtWidgets.QLabel("")
         form.addRow("服务器IP:", self.modbus_ip_label)
@@ -686,6 +712,13 @@ class MainWindow(QtWidgets.QWidget):
         vbox.addWidget(g_modbus)
         vbox.addStretch(1)
 
+        self._last_ip_shown = ""
+        self._refresh_modbus_ip()
+        self.ip_refresh_timer = QtCore.QTimer(self)
+        self.ip_refresh_timer.setInterval(2000)
+        self.ip_refresh_timer.timeout.connect(self._refresh_modbus_ip)
+        self.ip_refresh_timer.start()
+
     def _update_modbus_status(self):
         if self.modbus_server:
             status = "运行"
@@ -695,6 +728,12 @@ class MainWindow(QtWidgets.QWidget):
             status = "未启动"
         if hasattr(self, "modbus_status_lbl"):
             self.modbus_status_lbl.setText(status)
+
+    def _refresh_modbus_ip(self):
+        ip = get_local_ip()
+        if ip != self._last_ip_shown:
+            self.modbus_ip_label.setText(ip)
+            self._last_ip_shown = ip
 
     def _add_color_group(self, parent_layout, cfg: ColorCfg):
         g = QtWidgets.QGroupBox(cfg.group_title); g.setCheckable(True); g.setChecked(False); g.setFlat(True)
