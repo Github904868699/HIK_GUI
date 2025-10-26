@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 import os, sys
 from pathlib import Path
-import os, sys
-from pathlib import Path
+import struct
 
 def add_mvs_runtime_from_system():
     # 常见安装位置（64 位）
@@ -27,13 +26,12 @@ if getattr(sys, "frozen", False):
 from MvCameraControl_class import *  # 或你的实际导入
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
 import cv2
-import ctypes, json, socket, socketserver, sys, threading, time
+import ctypes, json, socket, socketserver, threading, time
 from MvCameraControl_class import (
     MvCamera,
     MV_CC_DEVICE_INFO_LIST, MV_CC_DEVICE_INFO,
@@ -62,7 +60,6 @@ APP_ICON  = "Camera.ico"
 CHS = {"circle": "圆形", "triangle": "三角形", "rect": "正方形"}
 MIN_AREA, MAX_AREA = 500, 300_000
 FPS_CALC_INTERVAL  = 30
-HEARTBEAT_DS_ID    = "www.hc-system.com.cam"
 
 def resource_path(rel: str) -> str:
     base = getattr(sys, "_MEIPASS", Path(__file__).parent)
@@ -94,19 +91,31 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     cfg = safe_load_json(path, default=None)
     if not cfg:
         cfg = {
-            "server": {"host": "127.0.0.1", "port": 6000},
+            "server": {"host": "0.0.0.0", "port": 502},
             "cmd_map": {
             },
             "colors": [
-                
+
             ]
         }
     if isinstance(cfg, list):
-        cfg = {"server": {"host":"127.0.0.1","port":6000}, "cmd_map": {}, "colors": cfg}
-    cfg.setdefault("server", {"host": "127.0.0.1", "port": 6000})
+        cfg = {"server": {"host":"0.0.0.0","port":502}, "cmd_map": {}, "colors": cfg}
+    cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("cmd_map", {})
     cfg.setdefault("colors", [])
     return cfg
+
+
+def get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
 
 @dataclass
 class ColorCfg:
@@ -144,6 +153,48 @@ def colors_from_config(cfg: dict) -> List[ColorCfg]:
         ))
     return colors
 
+def _parse_cmd_code(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped, 0)
+        except ValueError:
+            return None
+    return None
+
+
+def result_codes_from_cmd_map(cmd_map: dict) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for label, value in cmd_map.items():
+        code = _parse_cmd_code(value)
+        if code is not None:
+            out[label] = code
+            continue
+        parsed = None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    print(f"[MODBUS] 忽略无法解析的 cmd_map 项: {label}")
+                    continue
+        elif isinstance(value, dict):
+            parsed = value
+        if isinstance(parsed, dict):
+            code = _parse_cmd_code(parsed.get("code"))
+            if code is not None:
+                out[label] = code
+            else:
+                print(f"[MODBUS] cmd_map 项 {label} 缺少 'code' 数值，已忽略")
+        elif value is not None:
+            print(f"[MODBUS] cmd_map 项 {label} 类型不支持，已忽略")
+    return out
+
 class HSVSlider(QtWidgets.QWidget):
     valueChanged = QtCore.pyqtSignal(int)
     def __init__(self, text: str, mn: int, mx: int, val: int, parent=None):
@@ -174,141 +225,126 @@ class MaskWindow(QtWidgets.QWidget):
         ); self.label.setPixmap(pix)
 
 # TCP
-class HCRequestHandler(socketserver.BaseRequestHandler):
+class ModbusRegisterModel:
+    def __init__(self, size: int = 16):
+        self._lock = threading.Lock()
+        self._regs = [0] * max(size, 2)
+
+    def read(self, addr: int, count: int) -> List[int]:
+        with self._lock:
+            if addr < 0:
+                return [0] * max(count, 0)
+            end = addr + count
+            slice_regs = self._regs[addr:end]
+            if len(slice_regs) < count:
+                slice_regs.extend([0] * (count - len(slice_regs)))
+            return list(slice_regs)
+
+    def write(self, addr: int, values: List[int]):
+        if addr < 0:
+            return
+        with self._lock:
+            end = addr + len(values)
+            if end > len(self._regs):
+                self._regs.extend([0] * (end - len(self._regs)))
+            for i, v in enumerate(values):
+                self._regs[addr + i] = v & 0xFFFF
+
+    def set_register(self, addr: int, value: int):
+        self.write(addr, [value])
+
+
+class ModbusRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        # 兼容：既支持 NDJSON（行分隔）也支持无换行的单个 JSON 对象
-        buf = ""
-        decoder = json.JSONDecoder()
         while True:
-            data = self.request.recv(4096)
-            if not data:
-                # 连接结束前尽量把缓冲区里完整的 JSON 吃掉
-                buf = buf.strip()
-                if buf:
-                    buf = self._consume_json_objects(decoder, buf)
+            header = self._recvn(7)
+            if not header:
+                break
+            try:
+                tid, pid, length = struct.unpack(">HHH", header[:6])
+            except struct.error:
+                break
+            unit = header[6]
+            if length <= 0:
+                continue
+            payload = self._recvn(length - 1)
+            if payload is None:
+                break
+            if not payload:
+                continue
+            function = payload[0]
+            data = payload[1:]
+            response_pdu = self._handle_function(function, data)
+            if response_pdu is None:
+                continue
+            mbap = struct.pack(">HHHB", tid, 0, len(response_pdu) + 1, unit)
+            try:
+                self.request.sendall(mbap + response_pdu)
+            except Exception:
                 break
 
-            try:
-                chunk = data.decode("utf-8", errors="ignore")
-            except Exception:
-                continue
+    def _recvn(self, size: int):
+        buf = b""
+        while len(buf) < size:
+            chunk = self.request.recv(size - len(buf))
+            if not chunk:
+                return None if not buf else buf
             buf += chunk
+        return buf
 
-            # 1) 先处理带换行的（向后兼容）
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if line:
-                    self.server.on_message(line)
+    def _handle_function(self, function: int, data: bytes) -> bytes | None:
+        try:
+            if function == 3:  # Read Holding Registers
+                if len(data) < 4:
+                    raise ValueError
+                addr, count = struct.unpack(">HH", data[:4])
+                regs = self.server.model.read(addr, count)
+                payload = struct.pack(">B", len(regs) * 2)
+                if regs:
+                    payload += struct.pack(">" + "H" * len(regs), *regs)
+                return bytes([function]) + payload
+            elif function == 6:  # Write Single Register
+                if len(data) < 4:
+                    raise ValueError
+                addr, value = struct.unpack(">HH", data[:4])
+                self.server.model.write(addr, [value])
+                if self.server.on_write:
+                    self.server.on_write(addr, value & 0xFFFF)
+                return bytes([function]) + data[:4]
+            elif function == 16:  # Write Multiple Registers
+                if len(data) < 5:
+                    raise ValueError
+                addr, count, byte_count = struct.unpack(">HHB", data[:5])
+                expected = count * 2
+                if byte_count != expected or len(data[5:]) < expected:
+                    raise ValueError
+                raw = data[5:5 + expected]
+                values = list(struct.unpack(">" + "H" * count, raw))
+                self.server.model.write(addr, values)
+                if self.server.on_write:
+                    for i, v in enumerate(values):
+                        self.server.on_write(addr + i, v & 0xFFFF)
+                return bytes([function]) + struct.pack(">HH", addr, count)
+            else:
+                return bytes([function | 0x80, 1])
+        except Exception:
+            return bytes([function | 0x80, 3])
 
-            # 2) 再处理不带换行的完整 JSON（可连续多个）
-            buf = self._consume_json_objects(decoder, buf)
 
-    def _consume_json_objects(self, decoder, text):
-        # 尝试从开头 raw_decode 一个完整 JSON；成功就回调并剥离，失败说明数据还不完整
-        s = text.lstrip()
-        consumed_prefix = len(text) - len(s)
-        idx = 0
-        while s:
-            try:
-                obj, end = decoder.raw_decode(s, idx)
-            except ValueError:
-                break  # 不够组成完整 JSON，等下次 recv
-            raw = s[idx:end].strip()
-            if raw:
-                self.server.on_message(raw)
-            s = s[end:].lstrip()
-            idx = 0
-        return text[:consumed_prefix] + s
-
-
-class HCVisionServer(socketserver.ThreadingTCPServer):
+class ModbusTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
-    def __init__(self, host, port, on_message):
-        self.on_message = on_message
-        super().__init__((host, port), HCRequestHandler)
 
-def start_server(host="0.0.0.0", port=9760, on_message=lambda x: None):
-    svr = HCVisionServer(host, port, on_message)
-    threading.Thread(target=svr.serve_forever, daemon=True).start()
-    print(f"[TCP-SVR] listen on {host}:{port}")
-    return svr
+    def __init__(self, host: str, port: int, model: ModbusRegisterModel, on_write=None):
+        self.model = model
+        self.on_write = on_write
+        super().__init__((host, port), ModbusRequestHandler)
 
-class TcpSender:
-    def __init__(self, ip: str, port: int, on_recv=None):
-        self.sock = socket.create_connection((ip, port), timeout=5)
-        self.sock.settimeout(None)
-        self.on_recv = on_recv
-        threading.Thread(target=self._recv_loop, daemon=True).start()
-    
-    def _recv_loop(self):
-            # Support both NDJSON (newline-delimited) and standalone JSON without trailing newline.
-            str_buf = ""
-            decoder = json.JSONDecoder()
-            bs_buf = b""
-            while True:
-                try:
-                    data = self.sock.recv(4096)
-                    if not data:
-                        # flush any remaining complete JSON
-                        str_buf = str_buf.strip()
-                        if str_buf:
-                            str_buf = self._consume_json_objects(decoder, str_buf)
-                        break
-    
-                    # accumulate bytes
-                    bs_buf += data
-    
-                    # 1) Backward compatible: process NDJSON lines first
-                    while b"\n" in bs_buf:
-                        line, bs_buf = bs_buf.split(b"\n", 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            txt = line.decode("utf-8", errors="ignore")
-                        except Exception:
-                            continue
-                        if self.on_recv:
-                            self.on_recv(txt)
-    
-                    # 2) Then try to parse complete JSON objects from remainder (no newline case)
-                    try:
-                        chunk = bs_buf.decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-                    str_buf += chunk
-                    bs_buf = b""
-                    str_buf = self._consume_json_objects(decoder, str_buf)
-    
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-    
-    def _consume_json_objects(self, decoder, text):
-            s = text.lstrip()
-            consumed_prefix = len(text) - len(s)
-            idx = 0
-            while s:
-                try:
-                    obj, end = decoder.raw_decode(s, idx)
-                except ValueError:
-                    break
-                raw = s[idx:end].strip()
-                if raw and self.on_recv:
-                    self.on_recv(raw)
-                s = s[end:].lstrip()
-                idx = 0
-            return text[:consumed_prefix] + s
-    
-    def send_data(self, msg: str):
-        try: self.sock.sendall(msg.encode("utf-8")+b"\n")
-        except Exception as e: print("[TCP] 发送失败:", e)
-    def close(self):
-        try: self.sock.shutdown(socket.SHUT_RDWR)
-        except Exception: pass
-        finally: self.sock.close()
+
+def start_modbus_server(host: str, port: int, model: ModbusRegisterModel, on_write=None):
+    server = ModbusTCPServer(host, port, model, on_write=on_write)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[MODBUS] listen on {host}:{port}")
+    return server
 
 def _side_lengths(pts: np.ndarray):
     pts = pts.reshape(-1, 2)
@@ -556,21 +592,35 @@ class HikGrabber(QtCore.QThread):
             self.cam = None
 
 class MainWindow(QtWidgets.QWidget):
-    tcp_msg_sig = QtCore.pyqtSignal(str)
+    modbus_trigger_sig = QtCore.pyqtSignal()
     def __init__(self, config: dict):
         super().__init__(None, QtCore.Qt.Window)
         self.setWindowTitle(APP_TITLE); self.resize(1200, 720)
         self.config = config
-        self.cmd_map = dict(self.config.get("cmd_map", {}))
+        self.result_codes = result_codes_from_cmd_map(self.config.get("cmd_map", {}))
         self.colors = {c.name: c for c in colors_from_config(self.config)}
         self.mask_windows: Dict[str, MaskWindow] = {}
-        self._running = True
         self.frame_cnt = 0
         self.fps = 0.0
         self.last_time = time.time()
-        self.tcp_sender = None
         self.last_frame_bgr: np.ndarray | None = None
         self._last_paint_ts = 0.0
+
+        svr = self.config.get("server", {})
+        self.modbus_host = str(svr.get("host", "0.0.0.0") or "0.0.0.0")
+        self.modbus_port = int(svr.get("port", 502))
+        self.modbus_model = ModbusRegisterModel(size=16)
+        self.modbus_server = None
+        self.modbus_error: str | None = None
+        try:
+            self.modbus_server = start_modbus_server(
+                self.modbus_host, self.modbus_port, self.modbus_model, on_write=self._on_modbus_write
+            )
+        except Exception as exc:
+            print(f"[MODBUS] 启动失败: {exc}")
+            self.modbus_server = None
+            self.modbus_error = str(exc)
+        self.modbus_trigger_sig.connect(self._on_modbus_trigger)
 
         hbox = QtWidgets.QHBoxLayout(self)
         self.ctrl_panel = QtWidgets.QFrame(); self.ctrl_panel.setFixedWidth(340)
@@ -624,19 +674,12 @@ class MainWindow(QtWidgets.QWidget):
         self.msg_timer.timeout.connect(lambda: self.msg_label.setText(""))
 
         self._init_controls()
-
-        svr = self.config.get("server", {})
-        self.ip_input.setText(str(svr.get("host", "127.0.0.1")))
-        self.port_input.setText(str(svr.get("port", 6000)))
-        print(f"[配置] 默认服务器: {self.ip_input.text()}:{self.port_input.text()}")
+        self._update_modbus_status()
 
         self.grabber = HikGrabber(self)
         self.grabber.frameSignal.connect(self.on_frame_from_hik)
         self.grabber.infoSignal.connect(self.on_info)
         self.grabber.start()
-
-        self.svr = start_server(on_message=self.handle_tcp_msg)
-        self.tcp_msg_sig.connect(self._process_tcp_msg)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
@@ -652,19 +695,45 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_stop.clicked.connect(self.stop_camera)
         lay.addWidget(self.btn_reopen); lay.addWidget(self.btn_stop); vbox.addWidget(g_cam)
 
-        for cfg in self.colors.values(): self._add_color_group(vbox, cfg)
+        for cfg in self.colors.values():
+            self._add_color_group(vbox, cfg)
 
-        g_tcp = QtWidgets.QGroupBox("设置"); tl = QtWidgets.QVBoxLayout(g_tcp)
-        tl.addWidget(QtWidgets.QLabel("IP:")); self.ip_input = QtWidgets.QLineEdit("127.0.0.1"); tl.addWidget(self.ip_input)
-        tl.addWidget(QtWidgets.QLabel("端口:")); self.port_input = QtWidgets.QLineEdit("6000"); tl.addWidget(self.port_input)
-        tl.addWidget(QtWidgets.QLabel("内容:")); self.cmd_input = QtWidgets.QLineEdit(""); tl.addWidget(self.cmd_input)
-        hl = QtWidgets.QHBoxLayout()
-        self.connect_btn = QtWidgets.QPushButton("连接"); self.connect_btn.clicked.connect(self.connect_tcp)
-        self.send_btn    = QtWidgets.QPushButton("发送"); self.send_btn.clicked.connect(self.test_send)
-        self.recognize_btn = QtWidgets.QPushButton("识别"); self.recognize_btn.clicked.connect(self.recognize_once)
-        for b in (self.connect_btn, self.send_btn, self.recognize_btn): hl.addWidget(b)
-        tl.addLayout(hl); vbox.addWidget(g_tcp)
+        g_modbus = QtWidgets.QGroupBox("Modbus")
+        form = QtWidgets.QFormLayout(g_modbus)
+        self.modbus_ip_label = QtWidgets.QLabel("--")
+        self.modbus_port_label = QtWidgets.QLabel(str(self.modbus_port))
+        self.modbus_status_lbl = QtWidgets.QLabel("")
+        form.addRow("服务器IP:", self.modbus_ip_label)
+        form.addRow("端口:", self.modbus_port_label)
+        form.addRow("状态:", self.modbus_status_lbl)
+        self.recognize_btn = QtWidgets.QPushButton("手动识别")
+        self.recognize_btn.clicked.connect(self.recognize_once)
+        form.addRow(self.recognize_btn)
+        vbox.addWidget(g_modbus)
         vbox.addStretch(1)
+
+        self._last_ip_shown = ""
+        self._refresh_modbus_ip()
+        self.ip_refresh_timer = QtCore.QTimer(self)
+        self.ip_refresh_timer.setInterval(2000)
+        self.ip_refresh_timer.timeout.connect(self._refresh_modbus_ip)
+        self.ip_refresh_timer.start()
+
+    def _update_modbus_status(self):
+        if self.modbus_server:
+            status = "运行"
+        elif getattr(self, "modbus_error", None):
+            status = f"未启动: {self.modbus_error}"
+        else:
+            status = "未启动"
+        if hasattr(self, "modbus_status_lbl"):
+            self.modbus_status_lbl.setText(status)
+
+    def _refresh_modbus_ip(self):
+        ip = get_local_ip()
+        if ip != self._last_ip_shown:
+            self.modbus_ip_label.setText(ip)
+            self._last_ip_shown = ip
 
     def _add_color_group(self, parent_layout, cfg: ColorCfg):
         g = QtWidgets.QGroupBox(cfg.group_title); g.setCheckable(True); g.setChecked(False); g.setFlat(True)
@@ -712,39 +781,20 @@ class MainWindow(QtWidgets.QWidget):
         if getattr(self, "grabber", None) and self.grabber.isRunning():
             self.grabber.stop(); self.grabber.wait(1000)
 
-    def connect_tcp(self):
-        ip = self.ip_input.text().strip()
-        port = int(self.port_input.text())
-        try:
-            self.tcp_sender = TcpSender(ip, port, on_recv=self.handle_tcp_msg)
-            QtWidgets.QMessageBox.information(self, "成功", f"已连接 {ip}:{port}")
-            self.start_heartbeat()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", f"连接失败: {e}")
-    def test_send(self):
-        if not self.tcp_sender:
-            QtWidgets.QMessageBox.warning(self, "警告", "请先连接TCP服务器"); return
-        msg = self.cmd_input.text()
-        if msg.strip(): self.tcp_sender.send_data(msg)
-    def start_heartbeat(self, interval: int = 10):
-        if getattr(self, "_hb_thread", None): return
-        def loop():
-            while self._running:
-                if self.tcp_sender:
-                    hb = {"dsID": HEARTBEAT_DS_ID, "reqType": "heartbeat"}
-                    self.tcp_sender.send_data(json.dumps(hb, ensure_ascii=False))
-                time.sleep(interval)
-        self._hb_thread = threading.Thread(target=loop, daemon=True); self._hb_thread.start()
-    def handle_tcp_msg(self, text: str): self.tcp_msg_sig.emit(text)
-    @QtCore.pyqtSlot(str)
-    def _process_tcp_msg(self, text: str):
-        try: cmd = json.loads(text)
-        except Exception as e:
-            print(f"[协议] 非法 JSON: {e}"); return
-        if cmd.get("reqType") == "photo":
-            self.recognize_once()
-            if self.tcp_sender:
-                self.tcp_sender.send_data(json.dumps({"dsID":HEARTBEAT_DS_ID,"reqType":"photo","ret":1}, ensure_ascii=False))
+    def _on_modbus_write(self, addr: int, value: int):
+        if addr == 0 and value == 1:
+            print("[MODBUS] 收到拍照请求")
+            self.modbus_trigger_sig.emit()
+
+    @QtCore.pyqtSlot()
+    def _on_modbus_trigger(self):
+        self.modbus_model.set_register(1, 0)
+        self.recognize_once()
+        self.modbus_model.set_register(0, 0)
+
+    def _publish_modbus_result(self, value: int):
+        if getattr(self, "modbus_model", None):
+            self.modbus_model.set_register(1, value & 0xFFFF)
 
     @QtCore.pyqtSlot(np.ndarray)
     def on_frame_from_hik(self, frame_bgr: np.ndarray):
@@ -790,7 +840,9 @@ class MainWindow(QtWidgets.QWidget):
 
     def recognize_once(self):
         if self.last_frame_bgr is None:
-            print("[识别] 当前没有画面"); return
+            print("[识别] 当前没有画面")
+            self._publish_modbus_result(0)
+            return
         enabled_global = {"circle", "triangle", "rect"}
         img = self.last_frame_bgr.copy()
         labels = detect_shapes(img, list(self.colors.values()), enabled_global)
@@ -802,13 +854,21 @@ class MainWindow(QtWidgets.QWidget):
                 x, y, r, _ = max(cands, key=lambda t: t[3])
                 cv2.circle(img, (int(x), int(y)), int(r), (0, 215, 255), 2)
                 labels.append(("金色-圆形", (int(x - r), int(y - r - 6)), QtGui.QColor(255, 215, 0)))
+        result_value = 0
         if labels:
-            self.msg_label.setText("\n".join([t for t,_,_ in labels])); self.msg_timer.start(2000)
+            self.msg_label.setText("\n".join([t for t,_,_ in labels]))
+            self.msg_timer.start(2000)
             for text, *_ in labels:
-                if text in self.cmd_map and self.tcp_sender:
-                    self.tcp_sender.send_data(self.cmd_map[text])
+                code = self.result_codes.get(text)
+                if code is not None:
+                    result_value = int(code)
+                    break
+            if result_value == 0:
+                print("[识别] 未找到匹配的结果编码，保持 0")
         else:
             print("[识别] 未检测到目标")
+            self.msg_label.setText("")
+        self._publish_modbus_result(result_value)
 
     def toggle_mask(self, name: str):
         if name in self.mask_windows and self.mask_windows[name].isVisible():
@@ -844,14 +904,21 @@ class MainWindow(QtWidgets.QWidget):
             self.grabber.stop(); self.grabber.wait(1000)
 
     def closeEvent(self, e):
-        self._running = False
-        if getattr(self, "svr", None):
-            try: self.svr.shutdown()
-            except Exception: pass
-        if self.tcp_sender: self.tcp_sender.close(); self.tcp_sender = None
+        if getattr(self, "modbus_server", None):
+            try:
+                self.modbus_server.shutdown()
+            except Exception:
+                pass
+            try:
+                self.modbus_server.server_close()
+            except Exception:
+                pass
+            self.modbus_server = None
         if getattr(self, "grabber", None):
-            try: self.grabber.stop(); self.grabber.wait(1000)
-            except Exception: pass
+            try:
+                self.grabber.stop(); self.grabber.wait(1000)
+            except Exception:
+                pass
         super().closeEvent(e)
 
 def main():
