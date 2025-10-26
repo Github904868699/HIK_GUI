@@ -1,9 +1,9 @@
 {
-  "server": { "host": "169.254.69.10", "port": 9760 },
+  "server": { "host": "192.168.0.55", "port": 502 },
   "cmd_map": {
-    "金色-圆形": "{\"dsID\":\"www.hc-system.com.RemoteMonitor\",\"reqType\":\"command\",\"packID\":\"0\",\"cmdData\":[\"modifyOutput\",\"0\",\"27\",\"1\"]}",
-    "散热片-正方形": "{\"dsID\":\"www.hc-system.com.RemoteMonitor\",\"reqType\":\"command\",\"packID\":\"0\",\"cmdData\":[\"modifyOutput\",\"0\",\"28\",\"1\"]}",
-    "木头-正方形": "{\"dsID\":\"www.hc-system.com.RemoteMonitor\",\"reqType\":\"command\",\"packID\":\"0\",\"cmdData\":[\"modifyOutput\",\"0\",\"26\",\"1\"]}"
+    "金色-圆形": 1,
+    "散热片-正方形": 2,
+    "木头-正方形": 3
   },
   "colors": [
     {
