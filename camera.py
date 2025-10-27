@@ -2,7 +2,9 @@
 import os, sys
 from pathlib import Path
 import struct
+import ctypes
 
+from ctypes import POINTER, byref, cast, c_ubyte
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import numpy as np
@@ -22,6 +24,52 @@ APP_ICON  = "Camera.ico"
 CHS = {"circle": "圆形", "triangle": "三角形", "rect": "正方形"}
 MIN_AREA, MAX_AREA = 500, 300_000
 FPS_CALC_INTERVAL  = 30
+
+try:
+    from MvCameraControl_class import MvCamera
+    from CameraParams_header import (
+        MV_CC_DEVICE_INFO,
+        MV_CC_DEVICE_INFO_LIST,
+        MV_FRAME_OUT_INFO_EX,
+        MVCC_INTVALUE,
+        MV_CC_PIXEL_CONVERT_PARAM,
+    )
+    from CameraParams_const import MV_GIGE_DEVICE, MV_ACCESS_Exclusive
+    from PixelType_header import (
+        PixelType_Gvsp_BGR8_Packed,
+        PixelType_Gvsp_RGB8_Packed,
+        PixelType_Gvsp_Mono8,
+        PixelType_Gvsp_BayerRG8,
+        PixelType_Gvsp_BayerBG8,
+        PixelType_Gvsp_BayerGB8,
+        PixelType_Gvsp_BayerGR8,
+        PixelType_Gvsp_YUV422_Packed,
+        PixelType_Gvsp_YUV422_YUYV_Packed,
+    )
+    from MvErrorDefine_const import MV_OK
+    HIK_SDK_AVAILABLE = True
+    HIK_SDK_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - 平台可能缺少 SDK
+    MvCamera = None  # type: ignore[assignment]
+    MV_CC_DEVICE_INFO = None  # type: ignore[assignment]
+    MV_CC_DEVICE_INFO_LIST = None  # type: ignore[assignment]
+    MV_FRAME_OUT_INFO_EX = None  # type: ignore[assignment]
+    MVCC_INTVALUE = None  # type: ignore[assignment]
+    MV_CC_PIXEL_CONVERT_PARAM = None  # type: ignore[assignment]
+    MV_GIGE_DEVICE = 0  # type: ignore[assignment]
+    MV_ACCESS_Exclusive = 1  # type: ignore[assignment]
+    PixelType_Gvsp_BGR8_Packed = 0  # type: ignore[assignment]
+    PixelType_Gvsp_RGB8_Packed = 0  # type: ignore[assignment]
+    PixelType_Gvsp_Mono8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerRG8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerBG8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerGB8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerGR8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_YUV422_Packed = 0  # type: ignore[assignment]
+    PixelType_Gvsp_YUV422_YUYV_Packed = 0  # type: ignore[assignment]
+    MV_OK = 0  # type: ignore[assignment]
+    HIK_SDK_AVAILABLE = False
+    HIK_SDK_IMPORT_ERROR = exc
 
 def resource_path(rel: str) -> str:
     base = getattr(sys, "_MEIPASS", Path(__file__).parent)
@@ -389,6 +437,281 @@ def detect_shapes(frame_bgr: np.ndarray, color_cfgs: List['ColorCfg'], enabled_g
             labels.append((label_txt, tpos, qcolor))
     return labels
 
+class HikGrabber(QtCore.QThread):
+    frameSignal = QtCore.pyqtSignal(np.ndarray)
+    infoSignal = QtCore.pyqtSignal(str)
+    errorSignal = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        if not HIK_SDK_AVAILABLE or MvCamera is None:
+            reason = str(HIK_SDK_IMPORT_ERROR) if HIK_SDK_IMPORT_ERROR else "未检测到海康 SDK"
+            raise RuntimeError(f"海康 SDK 未就绪: {reason}")
+        self.camera: Optional['MvCamera'] = None
+        self._running = False
+        self._data_buf = None
+        self._data_ptr = None
+        self._convert_buf = None
+        self._convert_ptr = None
+        self._convert_buf_size = 0
+        self._payload_size = 0
+        self._last_emit_ts = 0.0
+        self._local_ip_int = self._ip_to_uint(get_local_ip())
+        self._bayer_types = {
+            PixelType_Gvsp_BayerRG8,
+            PixelType_Gvsp_BayerBG8,
+            PixelType_Gvsp_BayerGB8,
+            PixelType_Gvsp_BayerGR8,
+        }
+        self._last_stream_error = 0
+        self._last_convert_error = 0
+        self._last_unsupported_pixel = 0
+
+    @staticmethod
+    def _ip_to_uint(ip: str) -> Optional[int]:
+        try:
+            return struct.unpack(">I", socket.inet_aton(ip))[0]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _uint_to_ip(value: int) -> str:
+        try:
+            return socket.inet_ntoa(struct.pack(">I", value))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _decode_text(buf) -> str:
+        try:
+            raw = bytes(bytearray(buf))
+        except Exception:
+            return ""
+        raw = raw.split(b"\0", 1)[0]
+        try:
+            return raw.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+
+    def _is_same_lan(self, info) -> bool:
+        if not self._local_ip_int:
+            return False
+        try:
+            gige = info.SpecialInfo.stGigEInfo
+            cam_ip = int(gige.nCurrentIp)
+            mask = int(gige.nCurrentSubNetMask) or 0xFFFFFFFF
+            return (self._local_ip_int & mask) == (cam_ip & mask)
+        except Exception:
+            return False
+
+    def _format_device_name(self, info) -> str:
+        try:
+            gige = info.SpecialInfo.stGigEInfo
+            name = self._decode_text(gige.chUserDefinedName) or self._decode_text(gige.chModelName)
+            ip = self._uint_to_ip(int(gige.nCurrentIp))
+            if name and ip:
+                return f"{name} ({ip})"
+            if ip:
+                return f"Hik GIGE ({ip})"
+            return name or "Hik GIGE"
+        except Exception:
+            return "Hik GIGE"
+
+    def _select_device(self):
+        dev_list = MV_CC_DEVICE_INFO_LIST()
+        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
+        if ret != MV_OK:
+            raise RuntimeError(f"枚举海康相机失败: 0x{ret:08X}")
+        if dev_list.nDeviceNum == 0:
+            return None
+        accessible_candidates = []
+        for idx in range(int(dev_list.nDeviceNum)):
+            ptr = dev_list.pDeviceInfo[idx]
+            if not ptr:
+                continue
+            info_copy = MV_CC_DEVICE_INFO()
+            ctypes.memmove(
+                byref(info_copy),
+                ctypes.byref(ptr.contents),
+                ctypes.sizeof(MV_CC_DEVICE_INFO),
+            )
+            if not MvCamera.MV_CC_IsDeviceAccessible(info_copy, MV_ACCESS_Exclusive):
+                continue
+            display = self._format_device_name(info_copy)
+            if self._is_same_lan(info_copy):
+                return info_copy, display
+            accessible_candidates.append((info_copy, display))
+        if accessible_candidates:
+            return accessible_candidates[0]
+        return None
+
+    def _prepare_payload(self):
+        payload = MVCC_INTVALUE()
+        ret = self.camera.MV_CC_GetIntValue("PayloadSize", payload)
+        if ret != MV_OK or int(payload.nCurValue) <= 0:
+            raise RuntimeError(f"获取 PayloadSize 失败: 0x{ret:08X}")
+        self._payload_size = int(payload.nCurValue)
+        self._data_buf = (c_ubyte * self._payload_size)()
+        self._data_ptr = cast(self._data_buf, POINTER(c_ubyte))
+
+    def _get_int_value(self, key: str) -> Optional[int]:
+        if not self.camera:
+            return None
+        value = MVCC_INTVALUE()
+        ret = self.camera.MV_CC_GetIntValue(key, value)
+        if ret == MV_OK:
+            return int(value.nCurValue)
+        return None
+
+    def _ensure_convert_buffer(self, size: int):
+        if self._convert_buf_size < size:
+            self._convert_buf = (c_ubyte * size)()
+            self._convert_ptr = cast(self._convert_buf, POINTER(c_ubyte))
+            self._convert_buf_size = size
+
+    def _convert_frame(self, frame_info: 'MV_FRAME_OUT_INFO_EX') -> Optional[np.ndarray]:
+        width = int(frame_info.nWidth)
+        height = int(frame_info.nHeight)
+        frame_len = int(frame_info.nFrameLen)
+        pixel_type = int(frame_info.enPixelType)
+        if frame_len <= 0 or width <= 0 or height <= 0:
+            return None
+        if pixel_type == PixelType_Gvsp_BGR8_Packed:
+            arr = np.frombuffer(self._data_buf, dtype=np.uint8, count=frame_len)
+            return arr.reshape(height, width, 3).copy()
+        if pixel_type == PixelType_Gvsp_RGB8_Packed:
+            arr = np.frombuffer(self._data_buf, dtype=np.uint8, count=frame_len)
+            rgb = arr.reshape(height, width, 3)
+            return rgb[:, :, ::-1].copy()
+        if pixel_type == PixelType_Gvsp_Mono8:
+            arr = np.frombuffer(self._data_buf, dtype=np.uint8, count=frame_len)
+            gray = arr.reshape(height, width)
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        if pixel_type in self._bayer_types or pixel_type in {PixelType_Gvsp_YUV422_Packed, PixelType_Gvsp_YUV422_YUYV_Packed}:
+            dst_size = width * height * 3
+            self._ensure_convert_buffer(dst_size)
+            convert_param = MV_CC_PIXEL_CONVERT_PARAM()
+            convert_param.nWidth = width
+            convert_param.nHeight = height
+            convert_param.enSrcPixelType = pixel_type
+            convert_param.pSrcData = self._data_ptr
+            convert_param.nSrcDataLen = frame_len
+            convert_param.enDstPixelType = PixelType_Gvsp_BGR8_Packed
+            convert_param.pDstBuffer = self._convert_ptr
+            convert_param.nDstBufferSize = dst_size
+            convert_param.nDstLen = dst_size
+            ret = self.camera.MV_CC_ConvertPixelType(convert_param)
+            if ret != MV_OK:
+                if self._last_convert_error != ret:
+                    self.infoSignal.emit(f"[HIK] 像素转换失败: 0x{ret:08X}")
+                    self._last_convert_error = ret
+                return None
+            self._last_convert_error = 0
+            arr = np.frombuffer(self._convert_buf, dtype=np.uint8, count=dst_size)
+            return arr.reshape(height, width, 3).copy()
+        if self._last_unsupported_pixel != pixel_type:
+            self.infoSignal.emit(f"[HIK] 不支持的像素格式: 0x{pixel_type:08X}")
+            self._last_unsupported_pixel = pixel_type
+        return None
+
+    def _cleanup_camera(self):
+        if self.camera:
+            try:
+                self.camera.MV_CC_StopGrabbing()
+            except Exception:
+                pass
+            try:
+                self.camera.MV_CC_CloseDevice()
+            except Exception:
+                pass
+            try:
+                self.camera.MV_CC_DestroyHandle()
+            except Exception:
+                pass
+            self.camera = None
+        self._data_buf = None
+        self._data_ptr = None
+        self._convert_buf = None
+        self._convert_ptr = None
+        self._convert_buf_size = 0
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        initialized = False
+        try:
+            ret = MvCamera.MV_CC_Initialize()
+            if ret != MV_OK:
+                raise RuntimeError(f"初始化海康 SDK 失败: 0x{ret:08X}")
+            initialized = True
+            selection = self._select_device()
+            if not selection:
+                raise RuntimeError("未发现可用的海康相机")
+            device_info, display_name = selection
+            self.camera = MvCamera()
+            ret = self.camera.MV_CC_CreateHandle(device_info)
+            if ret != MV_OK:
+                raise RuntimeError(f"创建相机句柄失败: 0x{ret:08X}")
+            ret = self.camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+            if ret != MV_OK:
+                raise RuntimeError(f"打开相机失败: 0x{ret:08X}")
+            self._prepare_payload()
+            ret = self.camera.MV_CC_StartGrabbing()
+            if ret != MV_OK:
+                raise RuntimeError(f"启动取流失败: 0x{ret:08X}")
+            width = self._get_int_value("Width")
+            height = self._get_int_value("Height")
+            if width and height:
+                self.infoSignal.emit(f"[INFO] {display_name} {width}x{height}")
+            else:
+                self.infoSignal.emit(f"[INFO] {display_name}")
+            self._running = True
+            frame_info = MV_FRAME_OUT_INFO_EX()
+            grabbed = 0
+            last_fps_ts = time.time()
+            self._last_emit_ts = 0.0
+            while self._running:
+                ret = self.camera.MV_CC_GetOneFrameTimeout(self._data_ptr, self._payload_size, frame_info, 1000)
+                if ret != MV_OK:
+                    if ret != self._last_stream_error:
+                        self.infoSignal.emit(f"[HIK] 取流异常: 0x{ret:08X}")
+                        self._last_stream_error = ret
+                    continue
+                self._last_stream_error = 0
+                now = time.time()
+                grabbed += 1
+                if (now - self._last_emit_ts) < (1.0 / UI_TARGET_FPS):
+                    if (now - last_fps_ts) >= 1.0:
+                        fps = grabbed / (now - last_fps_ts)
+                        self.infoSignal.emit(f"[FPS] {fps:.1f}")
+                        grabbed = 0
+                        last_fps_ts = now
+                    continue
+                frame = self._convert_frame(frame_info)
+                if frame is None:
+                    continue
+                self._last_emit_ts = now
+                self.frameSignal.emit(frame)
+                if (now - last_fps_ts) >= 1.0:
+                    fps = grabbed / (now - last_fps_ts)
+                    self.infoSignal.emit(f"[FPS] {fps:.1f}")
+                    grabbed = 0
+                    last_fps_ts = now
+                QtCore.QThread.msleep(1)
+        except Exception as exc:
+            self._running = False
+            self.infoSignal.emit(f"[HIK] {exc}")
+            self.errorSignal.emit(str(exc))
+        finally:
+            self._cleanup_camera()
+            if initialized:
+                try:
+                    MvCamera.MV_CC_Finalize()
+                except Exception:
+                    pass
+
+
 class UsbGrabber(QtCore.QThread):
     frameSignal = QtCore.pyqtSignal(np.ndarray)
     infoSignal  = QtCore.pyqtSignal(str)
@@ -553,10 +876,8 @@ class MainWindow(QtWidgets.QWidget):
         self._init_controls()
         self._update_modbus_status()
 
-        self.grabber = UsbGrabber(self)
-        self.grabber.frameSignal.connect(self.on_frame_from_hik)
-        self.grabber.infoSignal.connect(self.on_info)
-        self.grabber.start()
+        self.grabber: Optional[QtCore.QThread] = None
+        self._start_camera()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
@@ -595,6 +916,25 @@ class MainWindow(QtWidgets.QWidget):
         self.ip_refresh_timer.setInterval(2000)
         self.ip_refresh_timer.timeout.connect(self._refresh_modbus_ip)
         self.ip_refresh_timer.start()
+
+    def _start_camera(self, prefer_hik: bool = True):
+        self.stop_camera()
+        if prefer_hik:
+            try:
+                grabber = HikGrabber(self)
+            except Exception as exc:
+                print(f"[HIK] {exc}")
+            else:
+                self.grabber = grabber
+                grabber.frameSignal.connect(self.on_frame_from_hik)
+                grabber.infoSignal.connect(self.on_info)
+                grabber.errorSignal.connect(self._on_hik_error)
+                grabber.start()
+                return
+        self.grabber = UsbGrabber(self)
+        self.grabber.frameSignal.connect(self.on_frame_from_hik)
+        self.grabber.infoSignal.connect(self.on_info)
+        self.grabber.start()
 
     def _update_modbus_status(self):
         if self.modbus_server:
@@ -647,16 +987,21 @@ class MainWindow(QtWidgets.QWidget):
         lv = cfg.sliders[f"{cfg.name}_minV"].value(); uv = cfg.sliders[f"{cfg.name}_maxV"].value()
         cfg.lower[:] = [lh, ls, lv]; cfg.upper[:] = [uh, us, uv]
 
+    @QtCore.pyqtSlot(str)
+    def _on_hik_error(self, message: str):
+        print(f"[HIK] {message}")
+        if isinstance(getattr(self, "grabber", None), HikGrabber):
+            self.stop_camera()
+            self._start_camera(prefer_hik=False)
+
     def reopen_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-        self.grabber = UsbGrabber(self)
-        self.grabber.frameSignal.connect(self.on_frame_from_hik)
-        self.grabber.infoSignal.connect(self.on_info)
-        self.grabber.start()
+        self._start_camera(prefer_hik=True)
+
     def stop_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
+        grabber = getattr(self, "grabber", None)
+        if grabber and grabber.isRunning():
+            grabber.stop(); grabber.wait(1000)
+        self.grabber = None
 
     def _on_modbus_write(self, addr: int, value: int):
         if addr == 0 and value == 1:
@@ -791,18 +1136,6 @@ class MainWindow(QtWidgets.QWidget):
         elif s.startswith("[FPS]"):
             self.lbl_fps.setText(s.replace("[FPS]","FPS").strip())
 
-    def reopen_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-        self.grabber = UsbGrabber(self)
-        self.grabber.frameSignal.connect(self.on_frame_from_hik)
-        self.grabber.infoSignal.connect(self.on_info)
-        self.grabber.start()
-
-    def stop_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-
     def closeEvent(self, e):
         if getattr(self, "modbus_server", None):
             try:
@@ -814,11 +1147,7 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
             self.modbus_server = None
-        if getattr(self, "grabber", None):
-            try:
-                self.grabber.stop(); self.grabber.wait(1000)
-            except Exception:
-                pass
+        self.stop_camera()
         super().closeEvent(e)
 
 def main():
