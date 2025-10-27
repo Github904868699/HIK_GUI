@@ -6,12 +6,17 @@ import ctypes
 
 from ctypes import POINTER, byref, cast, c_ubyte
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
 import cv2
 import json, socket, socketserver, threading, time
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - 运行环境可能缺少 psutil
+    psutil = None  # type: ignore
 
 CONFIG_PATH = "config.json"
 TARGET_DISPLAY_WIDTH = 1280
@@ -126,6 +131,38 @@ def get_local_ip() -> str:
             return socket.gethostbyname(socket.gethostname())
         except Exception:
             return "127.0.0.1"
+
+
+def list_local_ipv4_addresses() -> List[Tuple[str, str]]:
+    addresses: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+
+    if psutil is not None:
+        try:
+            for iface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        if ip and not ip.startswith("127.") and ip not in seen:
+                            addresses.append((ip, iface))
+                            seen.add(ip)
+        except Exception:
+            pass
+
+    hostname = socket.gethostname()
+    try:
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if ip and not ip.startswith("127.") and ip not in seen:
+                addresses.append((ip, hostname))
+                seen.add(ip)
+    except Exception:
+        pass
+
+    if not addresses:
+        ip = get_local_ip()
+        addresses.append((ip, ""))
+
+    return addresses
 
 @dataclass
 class ColorCfg:
@@ -812,14 +849,7 @@ class MainWindow(QtWidgets.QWidget):
         self.modbus_server = None
         self.modbus_error: str | None = None
         self._last_result_count = 0
-        try:
-            self.modbus_server = start_modbus_server(
-                self.modbus_host, self.modbus_port, self.modbus_model, on_write=self._on_modbus_write
-            )
-        except Exception as exc:
-            print(f"[MODBUS] 启动失败: {exc}")
-            self.modbus_server = None
-            self.modbus_error = str(exc)
+        self._start_modbus_server(self.modbus_host)
         self.modbus_trigger_sig.connect(self._on_modbus_trigger)
 
         hbox = QtWidgets.QHBoxLayout(self)
@@ -898,10 +928,11 @@ class MainWindow(QtWidgets.QWidget):
 
         g_modbus = QtWidgets.QGroupBox("Modbus")
         form = QtWidgets.QFormLayout(g_modbus)
-        self.modbus_ip_label = QtWidgets.QLabel("--")
+        self.modbus_ip_combo = QtWidgets.QComboBox()
+        self.modbus_ip_combo.currentIndexChanged.connect(self._on_modbus_ip_changed)
         self.modbus_port_label = QtWidgets.QLabel(str(self.modbus_port))
         self.modbus_status_lbl = QtWidgets.QLabel("")
-        form.addRow("服务器IP:", self.modbus_ip_label)
+        form.addRow("服务器IP:", self.modbus_ip_combo)
         form.addRow("端口:", self.modbus_port_label)
         form.addRow("状态:", self.modbus_status_lbl)
         self.recognize_btn = QtWidgets.QPushButton("手动识别")
@@ -910,7 +941,7 @@ class MainWindow(QtWidgets.QWidget):
         vbox.addWidget(g_modbus)
         vbox.addStretch(1)
 
-        self._last_ip_shown = ""
+        self._ip_choices: List[str] = []
         self._refresh_modbus_ip()
         self.ip_refresh_timer = QtCore.QTimer(self)
         self.ip_refresh_timer.setInterval(2000)
@@ -947,10 +978,88 @@ class MainWindow(QtWidgets.QWidget):
             self.modbus_status_lbl.setText(status)
 
     def _refresh_modbus_ip(self):
-        ip = get_local_ip()
-        if ip != self._last_ip_shown:
-            self.modbus_ip_label.setText(ip)
-            self._last_ip_shown = ip
+        if not hasattr(self, "modbus_ip_combo"):
+            return
+
+        entries = list_local_ipv4_addresses()
+        ips = [ip for ip, _ in entries]
+
+        if "0.0.0.0" not in ips:
+            ips.insert(0, "0.0.0.0")
+            entries.insert(0, ("0.0.0.0", "全部网口"))
+
+        if self.modbus_host not in ips:
+            entries.append((self.modbus_host, "当前"))
+            ips.append(self.modbus_host)
+
+        if ips != self._ip_choices:
+            blocker = QtCore.QSignalBlocker(self.modbus_ip_combo)
+            self.modbus_ip_combo.clear()
+            for ip, iface in entries:
+                if ip == "0.0.0.0":
+                    text = f"{ip} (全部网口)"
+                elif iface:
+                    text = f"{ip} ({iface})"
+                else:
+                    text = ip
+                self.modbus_ip_combo.addItem(text, ip)
+            self._ip_choices = ips
+            del blocker
+
+        current_idx = self.modbus_ip_combo.findData(self.modbus_host)
+        if current_idx < 0:
+            current_idx = 0
+        if self.modbus_ip_combo.currentIndex() != current_idx:
+            blocker = QtCore.QSignalBlocker(self.modbus_ip_combo)
+            self.modbus_ip_combo.setCurrentIndex(current_idx)
+            del blocker
+
+    def _on_modbus_ip_changed(self, index: int):
+        if index < 0:
+            return
+        data = self.modbus_ip_combo.itemData(index)
+        if not data:
+            data = self.modbus_ip_combo.itemText(index)
+        host = str(data)
+        if host and host != self.modbus_host:
+            self._start_modbus_server(host)
+
+    def _stop_modbus_server(self):
+        if not getattr(self, "modbus_server", None):
+            return
+        try:
+            self.modbus_server.shutdown()
+        except Exception:
+            pass
+        try:
+            self.modbus_server.server_close()
+        except Exception:
+            pass
+        self.modbus_server = None
+
+    def _start_modbus_server(self, host: Optional[str] = None):
+        if host is not None:
+            self.modbus_host = host
+
+        self._stop_modbus_server()
+        self.modbus_error = None
+
+        try:
+            self.modbus_server = start_modbus_server(
+                self.modbus_host, self.modbus_port, self.modbus_model, on_write=self._on_modbus_write
+            )
+        except Exception as exc:
+            print(f"[MODBUS] 启动失败: {exc}")
+            self.modbus_server = None
+            self.modbus_error = str(exc)
+
+        self.config.setdefault("server", {})
+        self.config["server"]["host"] = self.modbus_host
+        self.config["server"]["port"] = self.modbus_port
+
+        self._update_modbus_status()
+        if hasattr(self, "modbus_ip_combo"):
+            self._refresh_modbus_ip()
 
     def _add_color_group(self, parent_layout, cfg: ColorCfg):
         g = QtWidgets.QGroupBox(cfg.group_title); g.setCheckable(True); g.setChecked(False); g.setFlat(True)
@@ -1137,16 +1246,7 @@ class MainWindow(QtWidgets.QWidget):
             self.lbl_fps.setText(s.replace("[FPS]","FPS").strip())
 
     def closeEvent(self, e):
-        if getattr(self, "modbus_server", None):
-            try:
-                self.modbus_server.shutdown()
-            except Exception:
-                pass
-            try:
-                self.modbus_server.server_close()
-            except Exception:
-                pass
-            self.modbus_server = None
+        self._stop_modbus_server()
         self.stop_camera()
         super().closeEvent(e)
 
