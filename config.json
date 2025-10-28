@@ -11,21 +11,21 @@
       "bgr": [255, 0, 0],
       "lower": [103, 88, 0],
       "upper": [142, 249, 255],
-      "shapes": { "circle": false, "triangle": false, "rect": true }
+      "shapes": { "circle": false, "triangle": false, "rect": true, "rect_long": false }
     },
     {
       "name": "金色",
       "bgr": [0, 215, 255],
       "lower": [10, 68, 0],
       "upper": [25, 255, 255],
-      "shapes": { "circle": true, "triangle": false, "rect": false }
+      "shapes": { "circle": true, "triangle": false, "rect": false, "rect_long": false }
     },
     {
       "name": "木头",
       "bgr": [19, 69, 139],
       "lower": [8, 50, 78],
       "upper": [18, 192, 177],
-      "shapes": { "circle": false, "triangle": false, "rect": true }
+      "shapes": { "circle": false, "triangle": false, "rect": true, "rect_long": false }
     }
   ]
 }
