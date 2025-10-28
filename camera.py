@@ -26,7 +26,7 @@ RESULT_BASE_ADDR = 1  # 对应保持寄存器 40002
 
 APP_TITLE = "HIK MVS"
 APP_ICON  = "Camera.ico"
-CHS = {"circle": "圆形", "triangle": "三角形", "rect": "正方形"}
+CHS = {"circle": "圆形", "triangle": "三角形", "rect": "正方形", "rect_long": "长方形"}
 MIN_AREA, MAX_AREA = 500, 300_000
 FPS_CALC_INTERVAL  = 30
 
@@ -196,6 +196,7 @@ def colors_from_config(cfg: dict) -> List[ColorCfg]:
                 "circle": bool(shapes.get("circle", True)),
                 "triangle": bool(shapes.get("triangle", True)),
                 "rect": bool(shapes.get("rect", True)),
+                "rect_long": bool(shapes.get("rect_long", True)),
             }
         ))
     return colors
@@ -380,6 +381,7 @@ class ModbusRequestHandler(socketserver.BaseRequestHandler):
 
 class ModbusTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
     def __init__(self, host: str, port: int, model: ModbusRegisterModel, on_write=None):
         self.model = model
@@ -397,6 +399,29 @@ def _side_lengths(pts: np.ndarray):
     pts = pts.reshape(-1, 2)
     return [np.linalg.norm(pts[(i+1)%len(pts)]-pts[i]) for i in range(len(pts))]
 
+def _is_right_angle_quad(pts: np.ndarray, tolerance: float = 0.2) -> bool:
+    pts = pts.reshape(-1, 2)
+    if len(pts) != 4:
+        return False
+    for i in range(4):
+        v1 = pts[(i + 1) % 4] - pts[i]
+        v2 = pts[(i - 1) % 4] - pts[i]
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-5 or n2 < 1e-5:
+            return False
+        cosang = abs(np.dot(v1, v2) / (n1 * n2 + 1e-5))
+        if cosang > tolerance:
+            return False
+    return True
+
+def _quad_aspect_ratio(poly: np.ndarray) -> Optional[float]:
+    rect = cv2.minAreaRect(poly)
+    w, h = rect[1]
+    if w <= 1e-5 or h <= 1e-5:
+        return None
+    return max(w, h) / (min(w, h) + 1e-5)
+
 def classify_contour(cnt, circularity: float):
     peri = cv2.arcLength(cnt, True)
     poly = cv2.approxPolyDP(cnt, 0.04 * peri, True)
@@ -406,13 +431,15 @@ def classify_contour(cnt, circularity: float):
         if max(sides)/(min(sides)+1e-5) <= 1.20:
             return "triangle"
     elif verts == 4:
-        x,y,w,h = cv2.boundingRect(poly)
-        ar = w / float(h+1e-5)
-        if 0.85 <= ar <= 1.15:
-            pts = poly.reshape(-1,2)
-            v1 = pts[1]-pts[0]; v2=pts[2]-pts[1]
-            cosang = abs(np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)+1e-5))
-            if cosang <= 0.15: return "rect"
+        if not _is_right_angle_quad(poly):
+            return None
+        aspect = _quad_aspect_ratio(poly)
+        if aspect is None:
+            return None
+        if aspect <= 1.2:
+            return "rect"
+        if 1.25 <= aspect <= 1.6:
+            return "rect_long"
     elif circularity > 0.75:
         return "circle"
     return None
@@ -848,6 +875,7 @@ class MainWindow(QtWidgets.QWidget):
         self.modbus_model = ModbusRegisterModel(size=16)
         self.modbus_server = None
         self.modbus_error: str | None = None
+        self._modbus_shutdown_event: Optional[threading.Event] = None
         self._last_result_count = 0
         self._start_modbus_server(self.modbus_host)
         self.modbus_trigger_sig.connect(self._on_modbus_trigger)
@@ -1025,23 +1053,38 @@ class MainWindow(QtWidgets.QWidget):
             self._start_modbus_server(host)
 
     def _stop_modbus_server(self):
-        if not getattr(self, "modbus_server", None):
+        server = getattr(self, "modbus_server", None)
+        if not server:
+            self._modbus_shutdown_event = None
             return
-        try:
-            self.modbus_server.shutdown()
-        except Exception:
-            pass
-        try:
-            self.modbus_server.server_close()
-        except Exception:
-            pass
         self.modbus_server = None
+        done = threading.Event()
+
+        def do_shutdown():
+            try:
+                server.shutdown()
+            except Exception as exc:
+                print(f"[MODBUS] 停止异常: {exc}")
+            finally:
+                try:
+                    server.server_close()
+                except Exception as exc:
+                    print(f"[MODBUS] 关闭异常: {exc}")
+                done.set()
+
+        threading.Thread(target=do_shutdown, daemon=True).start()
+        self._modbus_shutdown_event = done
+        return done
 
     def _start_modbus_server(self, host: Optional[str] = None):
         if host is not None:
             self.modbus_host = host
 
-        self._stop_modbus_server()
+        shutdown_event = self._stop_modbus_server()
+        if shutdown_event is not None:
+            if not shutdown_event.wait(timeout=1.0):
+                print("[MODBUS] 等待旧连接关闭超时，继续启动新服务器")
+            self._modbus_shutdown_event = None
         self.modbus_error = None
 
         try:
@@ -1082,7 +1125,7 @@ class MainWindow(QtWidgets.QWidget):
         # 每色的形状开关（按 JSON 默认勾选）
         shape_box = QtWidgets.QGroupBox("")
         shape_lay = QtWidgets.QHBoxLayout(shape_box); shape_lay.setContentsMargins(6,4,6,4)
-        for key, text in (("circle","圆形"), ("triangle","三角形"), ("rect","正方形")):
+        for key, text in (("circle","圆形"), ("triangle","三角形"), ("rect","正方形"), ("rect_long", "长方形")):
             cb = QtWidgets.QCheckBox(text)
             cb.setChecked(bool(cfg.shapes_init.get(key, True)))
             shape_lay.addWidget(cb)
@@ -1159,7 +1202,7 @@ class MainWindow(QtWidgets.QWidget):
         self._last_paint_ts = t
         self.last_frame_bgr = frame_bgr
         self.frame_cnt += 1
-        enabled_global = {"circle", "triangle", "rect"}
+        enabled_global = {"circle", "triangle", "rect", "rect_long"}
         frame_draw = frame_bgr.copy()
         labels = detect_shapes(frame_draw, list(self.colors.values()), enabled_global)
 
@@ -1200,7 +1243,7 @@ class MainWindow(QtWidgets.QWidget):
             self.msg_timer.start(2000)
             self._publish_modbus_result(0xFF)
             return
-        enabled_global = {"circle", "triangle", "rect"}
+        enabled_global = {"circle", "triangle", "rect", "rect_long"}
         img = self.last_frame_bgr.copy()
         labels = detect_shapes(img, list(self.colors.values()), enabled_global)
         gold_cfg = self.colors.get("金色", None)
