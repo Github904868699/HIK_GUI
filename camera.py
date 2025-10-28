@@ -1196,7 +1196,9 @@ class MainWindow(QtWidgets.QWidget):
     def recognize_once(self):
         if self.last_frame_bgr is None:
             print("[识别] 当前没有画面")
-            self._publish_modbus_result(0)
+            self.msg_label.setText("未识别到目标")
+            self.msg_timer.start(2000)
+            self._publish_modbus_result(0xFF)
             return
         enabled_global = {"circle", "triangle", "rect"}
         img = self.last_frame_bgr.copy()
@@ -1219,10 +1221,14 @@ class MainWindow(QtWidgets.QWidget):
                     result_values.append(int(code))
             if not result_values:
                 print("[识别] 未找到匹配的结果编码，保持 0")
+                self._publish_modbus_result(0)
+            else:
+                self._publish_modbus_result(result_values)
         else:
             print("[识别] 未检测到目标")
-            self.msg_label.setText("")
-        self._publish_modbus_result(result_values)
+            self.msg_label.setText("未识别到目标")
+            self.msg_timer.start(2000)
+            self._publish_modbus_result(0xFF)
 
     def toggle_mask(self, name: str):
         if name in self.mask_windows and self.mask_windows[name].isVisible():
