@@ -253,6 +253,8 @@ class GrayMainWindow(QtWidgets.QWidget):
         self.resize(1140, 700)
 
         self.config: Dict[str, object] = load_config(CONFIG_PATH)
+        if not isinstance(self.config.get("ui"), dict):
+            self.config["ui"] = {}
         detection_cfg = self.config.get("detection", {})
         self.detection_settings = GrayDetectionSettings.from_dict(detection_cfg)
         self.config["detection"] = self.detection_settings.to_dict()
@@ -278,7 +280,7 @@ class GrayMainWindow(QtWidgets.QWidget):
         layout.setSpacing(12)
 
         self.ctrl_panel = QtWidgets.QFrame()
-        self.ctrl_panel.setFixedWidth(330)
+        self.ctrl_panel.setFixedWidth(300)
         layout.addWidget(self.ctrl_panel)
 
         right_panel = QtWidgets.QVBoxLayout()
@@ -359,144 +361,157 @@ class GrayMainWindow(QtWidgets.QWidget):
         self.recognize_btn.clicked.connect(lambda: self._handle_recognition_request(manual=True))
         vbox.addWidget(self.recognize_btn)
 
-        self._setting_widgets: Dict[str, QtWidgets.QWidget] = {}
         self._init_detection_group(vbox)
         self._init_modbus_group(vbox)
 
-        self.status_box = QtWidgets.QTextEdit()
-        self.status_box.setReadOnly(True)
-        self.status_box.setFixedHeight(190)
-        vbox.addWidget(self.status_box)
+        self.status_box: Optional[QtWidgets.QTextEdit] = None
         vbox.addStretch(1)
 
     def _init_detection_group(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
         group = QtWidgets.QGroupBox("识别参数")
-        group.setCheckable(False)
-        form = QtWidgets.QFormLayout(group)
+        group.setCheckable(True)
+        group.setChecked(False)
+        group.setFlat(True)
+
+        container = QtWidgets.QWidget()
+        container.setVisible(False)
+        form = QtWidgets.QFormLayout(container)
         form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         form.setFormAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        form.setContentsMargins(6, 6, 6, 6)
 
-        def add_spin(name: str, widget: QtWidgets.QWidget, label: str) -> None:
-            self._setting_widgets[name] = widget
-            form.addRow(label, widget)
+        group_lay = QtWidgets.QVBoxLayout()
+        group_lay.setContentsMargins(0, 0, 0, 0)
+        group_lay.addWidget(container)
+        group.setLayout(group_lay)
 
-        min_area = QtWidgets.QSpinBox()
-        min_area.setRange(0, 1_000_000)
-        min_area.setSingleStep(50)
-        min_area.valueChanged.connect(self._on_settings_changed)
-        add_spin("min_area", min_area, "面积下限")
+        group.toggled.connect(container.setVisible)
+        group.toggled.connect(self._on_detect_group_toggled)
 
-        max_area = QtWidgets.QSpinBox()
-        max_area.setRange(1, 5_000_000)
-        max_area.setSingleStep(100)
-        max_area.valueChanged.connect(self._on_settings_changed)
-        add_spin("max_area", max_area, "面积上限")
+        self._preset_combos: List[Tuple[QtWidgets.QComboBox, List[Tuple[str, Dict[str, object]]]]] = []
 
-        approx = QtWidgets.QDoubleSpinBox()
-        approx.setRange(0.005, 0.15)
-        approx.setDecimals(3)
-        approx.setSingleStep(0.005)
-        approx.valueChanged.connect(self._on_settings_changed)
-        add_spin("approx_epsilon", approx, "多边形逼近")
+        def add_combo(label: str, presets: List[Tuple[str, Dict[str, object]]]) -> None:
+            combo = QtWidgets.QComboBox()
+            for name, values in presets:
+                combo.addItem(name, values)
+            combo.currentIndexChanged.connect(self._on_preset_changed)
+            form.addRow(label, combo)
+            self._preset_combos.append((combo, presets))
 
-        angle_tol = QtWidgets.QDoubleSpinBox()
-        angle_tol.setRange(0.05, 0.5)
-        angle_tol.setDecimals(3)
-        angle_tol.setSingleStep(0.01)
-        angle_tol.valueChanged.connect(self._on_settings_changed)
-        add_spin("right_angle_tolerance", angle_tol, "直角容差")
-
-        square_max = QtWidgets.QDoubleSpinBox()
-        square_max.setRange(1.0, 1.5)
-        square_max.setDecimals(3)
-        square_max.setSingleStep(0.01)
-        square_max.valueChanged.connect(self._on_settings_changed)
-        add_spin("aspect_square_max", square_max, "正方形阈值")
-
-        rect_min = QtWidgets.QDoubleSpinBox()
-        rect_min.setRange(1.05, 4.0)
-        rect_min.setDecimals(3)
-        rect_min.setSingleStep(0.01)
-        rect_min.valueChanged.connect(self._on_settings_changed)
-        add_spin("aspect_rect_min", rect_min, "长方形最小比")
-
-        rect_max = QtWidgets.QDoubleSpinBox()
-        rect_max.setRange(1.1, 10.0)
-        rect_max.setDecimals(3)
-        rect_max.setSingleStep(0.05)
-        rect_max.valueChanged.connect(self._on_settings_changed)
-        add_spin("aspect_rect_max", rect_max, "长方形最大比")
-
-        merge = QtWidgets.QDoubleSpinBox()
-        merge.setRange(4.0, 60.0)
-        merge.setDecimals(2)
-        merge.setSingleStep(0.5)
-        merge.valueChanged.connect(self._on_settings_changed)
-        add_spin("merge_distance", merge, "目标合并距离")
-
-        gaussian = QtWidgets.QSpinBox()
-        gaussian.setRange(3, 15)
-        gaussian.setSingleStep(2)
-        gaussian.valueChanged.connect(self._on_settings_changed)
-        add_spin("gaussian_kernel", gaussian, "高斯核大小")
-
-        morph = QtWidgets.QSpinBox()
-        morph.setRange(1, 6)
-        morph.setValue(2)
-        morph.valueChanged.connect(self._on_settings_changed)
-        add_spin("morph_iterations", morph, "闭运算次数")
-
-        adaptive_block = QtWidgets.QSpinBox()
-        adaptive_block.setRange(3, 51)
-        adaptive_block.setSingleStep(2)
-        adaptive_block.valueChanged.connect(self._on_settings_changed)
-        add_spin("adaptive_block_size", adaptive_block, "自适应窗口")
-
-        adaptive_c = QtWidgets.QDoubleSpinBox()
-        adaptive_c.setRange(-15.0, 15.0)
-        adaptive_c.setDecimals(2)
-        adaptive_c.setSingleStep(0.5)
-        adaptive_c.valueChanged.connect(self._on_settings_changed)
-        add_spin("adaptive_c", adaptive_c, "自适应偏移")
-
-        canny1 = QtWidgets.QSpinBox()
-        canny1.setRange(0, 255)
-        canny1.valueChanged.connect(self._on_settings_changed)
-        add_spin("canny_threshold1", canny1, "Canny 阈值1")
-
-        canny2 = QtWidgets.QSpinBox()
-        canny2.setRange(0, 255)
-        canny2.valueChanged.connect(self._on_settings_changed)
-        add_spin("canny_threshold2", canny2, "Canny 阈值2")
-
-        edge_iter = QtWidgets.QSpinBox()
-        edge_iter.setRange(1, 10)
-        edge_iter.valueChanged.connect(self._on_settings_changed)
-        add_spin("edge_dilate_iterations", edge_iter, "边缘膨胀")
-
-        checks = QtWidgets.QGroupBox("阈值策略")
-        checks_lay = QtWidgets.QGridLayout(checks)
-        flags = [
-            ("use_otsu", "Otsu 阈值"),
-            ("use_invert", "Otsu 反转"),
-            ("use_adaptive", "自适应阈值"),
-            ("use_adaptive_invert", "自适应反转"),
-            ("use_edges", "边缘检测"),
-        ]
-        for idx, (name, text) in enumerate(flags):
-            cb = QtWidgets.QCheckBox(text)
-            cb.toggled.connect(self._on_settings_changed)
-            self._setting_widgets[name] = cb
-            row, col = divmod(idx, 2)
-            checks_lay.addWidget(cb, row, col)
-        form.addRow(checks)
+        add_combo(
+            "面积范围",
+            [
+                ("标准物料", {"min_area": 500, "max_area": 60000}),
+                ("小尺寸", {"min_area": 250, "max_area": 30000}),
+                ("大尺寸", {"min_area": 900, "max_area": 120000}),
+            ],
+        )
+        add_combo(
+            "识别精度",
+            [
+                ("标准", {"approx_epsilon": 0.03, "right_angle_tolerance": 0.25}),
+                ("严格", {"approx_epsilon": 0.02, "right_angle_tolerance": 0.18}),
+                ("宽松", {"approx_epsilon": 0.05, "right_angle_tolerance": 0.32}),
+            ],
+        )
+        add_combo(
+            "形状判定",
+            [
+                ("标准", {"aspect_square_max": 1.12, "aspect_rect_min": 1.2, "aspect_rect_max": 4.0}),
+                ("严格", {"aspect_square_max": 1.08, "aspect_rect_min": 1.25, "aspect_rect_max": 3.0}),
+                ("宽松", {"aspect_square_max": 1.18, "aspect_rect_min": 1.15, "aspect_rect_max": 5.0}),
+            ],
+        )
+        add_combo(
+            "阈值策略",
+            [
+                (
+                    "自动",
+                    {
+                        "use_otsu": True,
+                        "use_invert": True,
+                        "use_adaptive": True,
+                        "use_adaptive_invert": False,
+                        "use_edges": True,
+                    },
+                ),
+                (
+                    "自适应优先",
+                    {
+                        "use_otsu": False,
+                        "use_invert": False,
+                        "use_adaptive": True,
+                        "use_adaptive_invert": True,
+                        "use_edges": True,
+                    },
+                ),
+                (
+                    "纯阈值",
+                    {
+                        "use_otsu": True,
+                        "use_invert": False,
+                        "use_adaptive": False,
+                        "use_adaptive_invert": False,
+                        "use_edges": False,
+                    },
+                ),
+            ],
+        )
+        add_combo(
+            "滤波增强",
+            [
+                (
+                    "标准",
+                    {
+                        "gaussian_kernel": 5,
+                        "morph_iterations": 2,
+                        "merge_distance": 12.0,
+                        "adaptive_block_size": 21,
+                        "adaptive_c": 5.0,
+                        "canny_threshold1": 40,
+                        "canny_threshold2": 120,
+                        "edge_dilate_iterations": 1,
+                    },
+                ),
+                (
+                    "平滑",
+                    {
+                        "gaussian_kernel": 7,
+                        "morph_iterations": 1,
+                        "merge_distance": 14.0,
+                        "adaptive_block_size": 25,
+                        "adaptive_c": 7.0,
+                        "canny_threshold1": 35,
+                        "canny_threshold2": 100,
+                        "edge_dilate_iterations": 1,
+                    },
+                ),
+                (
+                    "锐利",
+                    {
+                        "gaussian_kernel": 3,
+                        "morph_iterations": 3,
+                        "merge_distance": 10.0,
+                        "adaptive_block_size": 17,
+                        "adaptive_c": 3.0,
+                        "canny_threshold1": 45,
+                        "canny_threshold2": 140,
+                        "edge_dilate_iterations": 2,
+                    },
+                ),
+            ],
+        )
 
         btn_reset = QtWidgets.QPushButton("恢复默认参数")
         btn_reset.clicked.connect(self._reset_detection_defaults)
         form.addRow(btn_reset)
 
         parent_layout.addWidget(group)
-        self._load_settings_to_ui()
+
+        self.detect_group = group
+        self._detect_container = container
+        self._load_presets_to_ui()
+        self._apply_presets_from_ui()
 
     def _init_modbus_group(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
         group = QtWidgets.QGroupBox("Modbus 通讯")
@@ -530,63 +545,80 @@ class GrayMainWindow(QtWidgets.QWidget):
 
         parent_layout.addWidget(group)
 
-    def _load_settings_to_ui(self) -> None:
+    def _load_presets_to_ui(self) -> None:
         settings = self.detection_settings
-        mapping = {
-            "min_area": int(settings.min_area),
-            "max_area": int(settings.max_area),
-            "approx_epsilon": float(settings.approx_epsilon),
-            "right_angle_tolerance": float(settings.right_angle_tolerance),
-            "aspect_square_max": float(settings.aspect_square_max),
-            "aspect_rect_min": float(settings.aspect_rect_min),
-            "aspect_rect_max": float(settings.aspect_rect_max),
-            "merge_distance": float(settings.merge_distance),
-            "gaussian_kernel": int(settings.gaussian_kernel),
-            "morph_iterations": int(settings.morph_iterations),
-            "adaptive_block_size": int(settings.adaptive_block_size),
-            "adaptive_c": float(settings.adaptive_c),
-            "canny_threshold1": int(settings.canny_threshold1),
-            "canny_threshold2": int(settings.canny_threshold2),
-            "edge_dilate_iterations": int(settings.edge_dilate_iterations),
-            "use_otsu": bool(settings.use_otsu),
-            "use_invert": bool(settings.use_invert),
-            "use_adaptive": bool(settings.use_adaptive),
-            "use_adaptive_invert": bool(settings.use_adaptive_invert),
-            "use_edges": bool(settings.use_edges),
-        }
-        for key, value in mapping.items():
-            widget = self._setting_widgets.get(key)
-            if widget is None:
-                continue
-            blocker = QtCore.QSignalBlocker(widget)
-            if isinstance(widget, QtWidgets.QSpinBox):
-                widget.setValue(int(value))
-            elif isinstance(widget, QtWidgets.QDoubleSpinBox):
-                widget.setValue(float(value))
-            elif isinstance(widget, QtWidgets.QCheckBox):
-                widget.setChecked(bool(value))
+        for combo, presets in self._preset_combos:
+            idx = self._find_preset_index(presets, settings)
+            blocker = QtCore.QSignalBlocker(combo)
+            combo.setCurrentIndex(idx)
             del blocker
 
-    def _on_settings_changed(self) -> None:
-        self._apply_settings_from_ui()
+        ui_cfg = self.config.get("ui")
+        visible = False
+        if isinstance(ui_cfg, dict):
+            visible = bool(ui_cfg.get("show_detection_panel", False))
+        blocker = QtCore.QSignalBlocker(self.detect_group)
+        self.detect_group.setChecked(visible)
+        del blocker
+        self._detect_container.setVisible(visible)
 
-    def _apply_settings_from_ui(self) -> None:
-        kwargs: Dict[str, object] = {}
-        for key, widget in self._setting_widgets.items():
-            if isinstance(widget, QtWidgets.QSpinBox):
-                kwargs[key] = widget.value()
-            elif isinstance(widget, QtWidgets.QDoubleSpinBox):
-                kwargs[key] = widget.value()
-            elif isinstance(widget, QtWidgets.QCheckBox):
-                kwargs[key] = widget.isChecked()
-        self.detection_settings = GrayDetectionSettings.from_dict(kwargs)
+    @staticmethod
+    def _value_close(current: object, target: object) -> bool:
+        if isinstance(target, bool):
+            return bool(current) is bool(target)
+        try:
+            cur = float(current)
+            tgt = float(target)
+        except (TypeError, ValueError):
+            return False
+        if abs(tgt) < 1:
+            tol = 0.01
+        else:
+            tol = max(0.05, abs(tgt) * 0.01)
+        return abs(cur - tgt) <= tol
+
+    def _find_preset_index(
+        self,
+        presets: Sequence[Tuple[str, Dict[str, object]]],
+        settings: GrayDetectionSettings,
+    ) -> int:
+        for idx, (_name, values) in enumerate(presets):
+            matched = True
+            for key, target in values.items():
+                current = getattr(settings, key, None)
+                if not self._value_close(current, target):
+                    matched = False
+                    break
+            if matched:
+                return idx
+        return 0
+
+    def _on_preset_changed(self) -> None:
+        self._apply_presets_from_ui()
+
+    def _apply_presets_from_ui(self) -> None:
+        merged: Dict[str, object] = dict(self.detection_settings.to_dict())
+        for combo, _ in self._preset_combos:
+            data = combo.currentData()
+            if isinstance(data, dict):
+                merged.update(data)
+        new_settings = GrayDetectionSettings.from_dict(merged)
+        changed = new_settings.to_dict() != self.detection_settings.to_dict()
+        self.detection_settings = new_settings
         self.config["detection"] = self.detection_settings.to_dict()
-        self._save_config()
+        if changed:
+            self._save_config()
 
     def _reset_detection_defaults(self) -> None:
         self.detection_settings = GrayDetectionSettings()
         self.config["detection"] = self.detection_settings.to_dict()
-        self._load_settings_to_ui()
+        self._load_presets_to_ui()
+        self._save_config()
+
+    def _on_detect_group_toggled(self, checked: bool) -> None:
+        ui_cfg = self.config.setdefault("ui", {})
+        if isinstance(ui_cfg, dict):
+            ui_cfg["show_detection_panel"] = bool(checked)
         self._save_config()
 
     def start_camera(self, prefer_hik: bool = True) -> None:
@@ -727,10 +759,15 @@ class GrayMainWindow(QtWidgets.QWidget):
         self._append_status(f"[ERROR] {message}")
         self.msg_label.setText(message)
         self.msg_timer.start(4000)
+        if isinstance(self.grabber, HikGrabber):
+            self.start_camera(prefer_hik=False)
 
     def _append_status(self, text: str) -> None:
-        self.status_box.append(text)
-        self.status_box.moveCursor(QtGui.QTextCursor.End)
+        if self.status_box:
+            self.status_box.append(text)
+            self.status_box.moveCursor(QtGui.QTextCursor.End)
+        else:
+            print(text)
 
     def _refresh_modbus_ip(self) -> None:
         entries = [("0.0.0.0", "全部网口")] + list_local_ipv4_addresses()
