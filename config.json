@@ -34,6 +34,9 @@
     "merge_distance": 12.0,
     "angle_tolerance": 0.25,
     "approx_epsilon": 0.03,
+    "contrast_alpha": 1.0,
+    "contrast_beta": 0.0,
+    "clahe_clip": 0.0,
     "shapes": {
       "square": {
         "enabled": true,

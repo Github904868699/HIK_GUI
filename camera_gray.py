@@ -150,6 +150,25 @@ class GrayDetection:
         return int(x), max(24, int(y) - 10)
 
 
+def _prepare_gray(
+    gray: np.ndarray,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    clahe_clip: float = 0.0,
+    clahe_grid: int = 8,
+) -> np.ndarray:
+    processed = gray
+    if clahe_clip > 0:
+        clip = max(0.1, clahe_clip)
+        grid = max(1, int(clahe_grid))
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(grid, grid))
+        processed = clahe.apply(processed)
+    if alpha != 1.0 or beta != 0.0:
+        processed = cv2.convertScaleAbs(processed, alpha=max(0.1, alpha), beta=beta)
+    return processed
+
+
 def _iter_thresholds(gray: np.ndarray) -> Iterable[np.ndarray]:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -179,8 +198,17 @@ def detect_gray_shapes(
     merge_distance: float,
     angle_tolerance: float,
     approx_epsilon: float,
+    contrast_alpha: float = 1.0,
+    contrast_beta: float = 0.0,
+    clahe_clip_limit: float = 0.0,
 ) -> Tuple[List[GrayDetection], Dict[str, np.ndarray]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = _prepare_gray(
+        gray,
+        alpha=contrast_alpha,
+        beta=contrast_beta,
+        clahe_clip=clahe_clip_limit,
+    )
     detections: List[GrayDetection] = []
     centers: List[np.ndarray] = []
     masks: Dict[str, np.ndarray] = {}
@@ -249,6 +277,9 @@ class GrayMainWindow(QtWidgets.QWidget):
         self.merge_distance = float(gray_section.get("merge_distance", 12.0))
         self.angle_tolerance = float(gray_section.get("angle_tolerance", 0.25))
         self.approx_epsilon = float(gray_section.get("approx_epsilon", 0.03))
+        self.contrast_alpha = float(gray_section.get("contrast_alpha", 1.0))
+        self.contrast_beta = float(gray_section.get("contrast_beta", 0.0))
+        self.clahe_clip = float(gray_section.get("clahe_clip", 0.0))
 
         self.result_codes = result_codes_from_cmd_map(self.config.get("cmd_map", {}))
 
@@ -357,6 +388,7 @@ class GrayMainWindow(QtWidgets.QWidget):
         vbox.addWidget(self.recognize_btn)
 
         self._create_shape_controls(vbox)
+        self._create_preprocess_controls(vbox)
 
         g_modbus = QtWidgets.QGroupBox("Modbus")
         form = QtWidgets.QFormLayout(g_modbus)
@@ -429,6 +461,60 @@ class GrayMainWindow(QtWidgets.QWidget):
             group_layout.addWidget(container)
 
         parent_layout.addWidget(group)
+
+    def _create_preprocess_controls(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("亮度/对比调整")
+        layout = QtWidgets.QVBoxLayout(group)
+
+        self.contrast_slider = ParamSlider(
+            "对比度",
+            0.5,
+            3.0,
+            self.contrast_alpha,
+            step=0.05,
+            decimals=2,
+        )
+        self.contrast_slider.valueChanged.connect(self._on_contrast_alpha_changed)
+        layout.addWidget(self.contrast_slider)
+
+        self.brightness_slider = ParamSlider(
+            "亮度",
+            -80.0,
+            80.0,
+            self.contrast_beta,
+            step=2.0,
+        )
+        self.brightness_slider.valueChanged.connect(self._on_contrast_beta_changed)
+        layout.addWidget(self.brightness_slider)
+
+        self.clahe_slider = ParamSlider(
+            "局部对比",
+            0.0,
+            5.0,
+            self.clahe_clip,
+            step=0.1,
+            decimals=1,
+        )
+        self.clahe_slider.valueChanged.connect(self._on_clahe_changed)
+        layout.addWidget(self.clahe_slider)
+
+        parent_layout.addWidget(group)
+
+    def _update_gray_config(self, key: str, value: float) -> None:
+        gray_section = self.config.setdefault("gray_shapes", {})
+        gray_section[key] = value
+
+    def _on_contrast_alpha_changed(self, value: float) -> None:
+        self.contrast_alpha = max(0.1, float(value))
+        self._update_gray_config("contrast_alpha", self.contrast_alpha)
+
+    def _on_contrast_beta_changed(self, value: float) -> None:
+        self.contrast_beta = float(value)
+        self._update_gray_config("contrast_beta", self.contrast_beta)
+
+    def _on_clahe_changed(self, value: float) -> None:
+        self.clahe_clip = max(0.0, float(value))
+        self._update_gray_config("clahe_clip", self.clahe_clip)
 
     def _build_shape_sliders(self, cfg: GrayShapeConfig) -> List[ParamSlider]:
         sliders: List[ParamSlider] = []
@@ -547,6 +633,9 @@ class GrayMainWindow(QtWidgets.QWidget):
             merge_distance=self.merge_distance,
             angle_tolerance=self.angle_tolerance,
             approx_epsilon=self.approx_epsilon,
+            contrast_alpha=self.contrast_alpha,
+            contrast_beta=self.contrast_beta,
+            clahe_clip_limit=self.clahe_clip,
         )
         self.last_detections = detections
         self._update_mask_windows(masks)
@@ -736,6 +825,9 @@ class GrayMainWindow(QtWidgets.QWidget):
             merge_distance=self.merge_distance,
             angle_tolerance=self.angle_tolerance,
             approx_epsilon=self.approx_epsilon,
+            contrast_alpha=self.contrast_alpha,
+            contrast_beta=self.contrast_beta,
+            clahe_clip_limit=self.clahe_clip,
         )
         self.last_detections = detections
         self._update_mask_windows(masks)
