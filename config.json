@@ -1,31 +1,29 @@
 {
   "server": { "host": "0.0.0.0", "port": 502 },
   "cmd_map": {
-    "金色-圆形": "0x11",
-    "木头-正方形": "0x12",
-    "散热片-正方形": "0x13"
+    "正方形": "0x12",
+    "长方形": "0x13"
   },
-  "colors": [
-    {
-      "name": "散热片",
-      "bgr": [255, 0, 0],
-      "lower": [103, 88, 0],
-      "upper": [142, 249, 255],
-      "shapes": { "circle": false, "triangle": false, "rect": true, "rect_long": false }
-    },
-    {
-      "name": "金色",
-      "bgr": [0, 215, 255],
-      "lower": [10, 68, 0],
-      "upper": [25, 255, 255],
-      "shapes": { "circle": true, "triangle": false, "rect": false, "rect_long": false }
-    },
-    {
-      "name": "木头",
-      "bgr": [19, 69, 139],
-      "lower": [8, 50, 78],
-      "upper": [18, 192, 177],
-      "shapes": { "circle": false, "triangle": false, "rect": true, "rect_long": false }
-    }
-  ]
+  "detection": {
+    "min_area": 800,
+    "max_area": 250000,
+    "approx_epsilon": 0.03,
+    "right_angle_tolerance": 0.25,
+    "aspect_square_max": 1.15,
+    "aspect_rect_min": 1.2,
+    "aspect_rect_max": 4.0,
+    "merge_distance": 14.0,
+    "gaussian_kernel": 5,
+    "morph_iterations": 2,
+    "adaptive_block_size": 21,
+    "adaptive_c": 4.5,
+    "canny_threshold1": 40,
+    "canny_threshold2": 120,
+    "edge_dilate_iterations": 1,
+    "use_otsu": true,
+    "use_invert": true,
+    "use_adaptive": true,
+    "use_adaptive_invert": true,
+    "use_edges": true
+  }
 }
