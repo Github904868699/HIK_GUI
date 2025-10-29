@@ -118,6 +118,23 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("cmd_map", {})
     cfg.setdefault("colors", [])
+    gray_cfg = cfg.setdefault("gray_shapes", {})
+    shapes = gray_cfg.setdefault("shapes", {})
+    square = shapes.setdefault("square", {})
+    square.setdefault("enabled", True)
+    square.setdefault("min_area", 1200)
+    square.setdefault("max_area", 120000)
+    square.setdefault("min_aspect", 1.0)
+    square.setdefault("max_aspect", 1.2)
+    rect = shapes.setdefault("rectangle", {})
+    rect.setdefault("enabled", True)
+    rect.setdefault("min_area", 1500)
+    rect.setdefault("max_area", 180000)
+    rect.setdefault("min_aspect", 1.2)
+    rect.setdefault("max_aspect", 3.5)
+    gray_cfg.setdefault("merge_distance", 12.0)
+    gray_cfg.setdefault("angle_tolerance", 0.25)
+    gray_cfg.setdefault("approx_epsilon", 0.03)
     return cfg
 
 

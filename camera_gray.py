@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
-from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -19,13 +20,18 @@ from PyQt5.QtGui import QIcon
 from camera import (
     APP_ICON,
     APP_TITLE,
-    MIN_AREA,
-    MAX_AREA,
     UI_PAINT_FPS,
     HikGrabber,
+    MaskWindow,
+    ModbusRegisterModel,
+    RESULT_BASE_ADDR,
     UsbGrabber,
+    list_local_ipv4_addresses,
+    load_config,
+    result_codes_from_cmd_map,
     rounded_qpixmap,
     resource_path,
+    start_modbus_server,
     _is_right_angle_quad,
     _quad_aspect_ratio,
 )
@@ -37,6 +43,99 @@ SHAPE_COLORS = {
     "正方形": (72, 201, 111),  # BGR
     "长方形": (0, 191, 255),
 }
+
+
+class ParamSlider(QtWidgets.QWidget):
+    valueChanged = QtCore.pyqtSignal(float)
+
+    def __init__(
+        self,
+        text: str,
+        minimum: float,
+        maximum: float,
+        value: float,
+        *,
+        step: float = 1.0,
+        decimals: int = 0,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._min = float(minimum)
+        self._max = float(maximum)
+        self._step = float(step)
+        self._decimals = int(decimals)
+        slider_steps = max(1, int(round((self._max - self._min) / self._step)))
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.label = QtWidgets.QLabel(text)
+        layout.addWidget(self.label)
+
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setRange(0, slider_steps)
+        layout.addWidget(self.slider, 1)
+
+        self.value_label = QtWidgets.QLabel("0")
+        self.value_label.setFixedWidth(72)
+        layout.addWidget(self.value_label, 0)
+
+        self.slider.valueChanged.connect(self._on_value_changed)
+        self.setValue(value)
+
+    def _format_value(self, value: float) -> str:
+        return f"{value:.{self._decimals}f}" if self._decimals else f"{int(round(value))}"
+
+    def _on_value_changed(self, _: int) -> None:
+        val = self.value()
+        self.value_label.setText(self._format_value(val))
+        self.valueChanged.emit(val)
+
+    def value(self) -> float:
+        pos = self.slider.value()
+        return self._min + pos * self._step
+
+    def setValue(self, value: float) -> None:
+        clamped = min(max(value, self._min), self._max)
+        pos = int(round((clamped - self._min) / self._step))
+        self.slider.blockSignals(True)
+        self.slider.setValue(pos)
+        self.slider.blockSignals(False)
+        self.value_label.setText(self._format_value(self.value()))
+
+
+@dataclass
+class GrayShapeConfig:
+    key: str
+    label: str
+    enabled: bool
+    min_area: int
+    max_area: int
+    min_aspect: Optional[float] = None
+    max_aspect: Optional[float] = None
+    sliders: Dict[str, ParamSlider] = field(default_factory=dict)
+    checkbox: Optional[QtWidgets.QCheckBox] = None
+    panel: Optional[QtWidgets.QWidget] = None
+
+    def accepts(self, area: float, aspect: float) -> bool:
+        if area < self.min_area or area > self.max_area:
+            return False
+        if self.min_aspect is not None and aspect < self.min_aspect:
+            return False
+        if self.max_aspect is not None and aspect > self.max_aspect:
+            return False
+        return True
+
+    def sync_from_sliders(self) -> None:
+        if "min_area" in self.sliders:
+            self.min_area = int(self.sliders["min_area"].value())
+        if "max_area" in self.sliders:
+            self.max_area = int(self.sliders["max_area"].value())
+        if "min_aspect" in self.sliders:
+            self.min_aspect = float(self.sliders["min_aspect"].value())
+        if "max_aspect" in self.sliders:
+            self.max_aspect = float(self.sliders["max_aspect"].value())
+
 
 
 @dataclass
@@ -73,56 +172,108 @@ def _iter_thresholds(gray: np.ndarray) -> Iterable[np.ndarray]:
     yield cv2.dilate(edges, kernel, iterations=1)
 
 
-def detect_gray_shapes(frame_bgr: np.ndarray) -> List[GrayDetection]:
+def detect_gray_shapes(
+    frame_bgr: np.ndarray,
+    shape_cfgs: Sequence[GrayShapeConfig],
+    *,
+    merge_distance: float,
+    angle_tolerance: float,
+    approx_epsilon: float,
+) -> Tuple[List[GrayDetection], Dict[str, np.ndarray]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     detections: List[GrayDetection] = []
-    centers: List[Tuple[float, float]] = []
+    centers: List[np.ndarray] = []
+    masks: Dict[str, np.ndarray] = {}
+    height, width = gray.shape
+    for cfg in shape_cfgs:
+        if cfg.enabled:
+            masks[cfg.label] = np.zeros((height, width), dtype=np.uint8)
 
     for mask in _iter_thresholds(gray):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if not (MIN_AREA < area < MAX_AREA):
+            if area <= 0:
                 continue
             perimeter = cv2.arcLength(cnt, True)
             if perimeter <= 0:
                 continue
-            approx = cv2.approxPolyDP(cnt, 0.03 * perimeter, True)
+            approx = cv2.approxPolyDP(cnt, max(1.0, approx_epsilon * perimeter), True)
             if len(approx) != 4 or not cv2.isContourConvex(approx):
                 continue
-            if not _is_right_angle_quad(approx, tolerance=0.25):
+            if not _is_right_angle_quad(approx, tolerance=angle_tolerance):
                 continue
             aspect = _quad_aspect_ratio(approx)
             if aspect is None:
                 continue
-            label = "正方形" if aspect <= 1.15 else "长方形"
+            target_cfg: GrayShapeConfig | None = None
+            for cfg in shape_cfgs:
+                if not cfg.enabled:
+                    continue
+                if cfg.accepts(area, aspect):
+                    target_cfg = cfg
+                    break
+            if target_cfg is None:
+                continue
             pts = approx.reshape(-1, 2).astype(float)
-            center = tuple(pts.mean(axis=0))
-            if any(np.linalg.norm(np.array(center) - np.array(prev)) < 12.0 for prev in centers):
+            center = pts.mean(axis=0)
+            if any(np.linalg.norm(center - prev) < merge_distance for prev in centers):
                 continue
             centers.append(center)
             bbox = cv2.boundingRect(approx)
-            detections.append(GrayDetection(label=label, contour=approx, bbox=bbox))
+            detections.append(GrayDetection(label=target_cfg.label, contour=approx, bbox=bbox))
+            if target_cfg.label in masks:
+                cv2.drawContours(masks[target_cfg.label], [approx], -1, 255, thickness=-1)
 
-    return detections
+    return detections, masks
 
 
 class GrayMainWindow(QtWidgets.QWidget):
+    modbus_trigger_sig = QtCore.pyqtSignal()
+
     def __init__(self):
         super().__init__(None, QtCore.Qt.Window)
         self.setWindowTitle(APP_TITLE_GRAY)
         self.resize(1100, 680)
 
+        self.config = load_config()
+        gray_section = self.config.get("gray_shapes", {})
+        shapes_conf: Mapping[str, dict] = gray_section.get("shapes", {})
+        self.shape_cfgs: Dict[str, GrayShapeConfig] = self._create_shape_configs(shapes_conf)
+        self.shape_cfg_list: List[GrayShapeConfig] = [
+            self.shape_cfgs[key]
+            for key in ("square", "rectangle")
+            if key in self.shape_cfgs
+        ]
+
+        self.merge_distance = float(gray_section.get("merge_distance", 12.0))
+        self.angle_tolerance = float(gray_section.get("angle_tolerance", 0.25))
+        self.approx_epsilon = float(gray_section.get("approx_epsilon", 0.03))
+
+        self.result_codes = result_codes_from_cmd_map(self.config.get("cmd_map", {}))
+
+        self.mask_windows: Dict[str, MaskWindow] = {}
+        self.last_masks: Dict[str, np.ndarray] = {}
         self.last_frame_bgr: np.ndarray | None = None
         self._last_paint_ts = 0.0
         self.last_detections: List[GrayDetection] = []
+        self._status_messages: List[str] = []
+
+        server_cfg = self.config.get("server", {})
+        self.modbus_host = str(server_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+        self.modbus_port = int(server_cfg.get("port", 502) or 502)
+        self.modbus_model = ModbusRegisterModel(size=16)
+        self.modbus_server = None
+        self.modbus_error: Optional[str] = None
+        self._modbus_shutdown_event: Optional[threading.Event] = None
+        self._last_result_count = 0
 
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
         self.ctrl_panel = QtWidgets.QFrame()
-        self.ctrl_panel.setFixedWidth(300)
+        self.ctrl_panel.setFixedWidth(320)
         layout.addWidget(self.ctrl_panel)
 
         right_panel = QtWidgets.QVBoxLayout()
@@ -176,6 +327,14 @@ class GrayMainWindow(QtWidgets.QWidget):
 
         self._init_controls()
 
+        self.modbus_trigger_sig.connect(self._on_modbus_trigger)
+        self._start_modbus_server(self.modbus_host)
+        self._refresh_modbus_ip()
+        self.ip_refresh_timer = QtCore.QTimer(self)
+        self.ip_refresh_timer.setInterval(5000)
+        self.ip_refresh_timer.timeout.connect(self._refresh_modbus_ip)
+        self.ip_refresh_timer.start()
+
         self.grabber: QtCore.QThread | None = None
         self.start_camera()
 
@@ -197,11 +356,339 @@ class GrayMainWindow(QtWidgets.QWidget):
         self.recognize_btn.clicked.connect(self.recognize_once)
         vbox.addWidget(self.recognize_btn)
 
-        self.status_box = QtWidgets.QTextEdit()
-        self.status_box.setReadOnly(True)
-        self.status_box.setFixedHeight(160)
-        vbox.addWidget(self.status_box)
+        self._create_shape_controls(vbox)
+
+        g_modbus = QtWidgets.QGroupBox("Modbus")
+        form = QtWidgets.QFormLayout(g_modbus)
+        self.modbus_ip_combo = QtWidgets.QComboBox()
+        self.modbus_ip_combo.currentIndexChanged.connect(self._on_modbus_ip_changed)
+        self.modbus_port_label = QtWidgets.QLabel(str(self.modbus_port))
+        self.modbus_status_lbl = QtWidgets.QLabel("")
+        form.addRow("服务器IP:", self.modbus_ip_combo)
+        form.addRow("端口:", self.modbus_port_label)
+        form.addRow("状态:", self.modbus_status_lbl)
+        vbox.addWidget(g_modbus)
+
         vbox.addStretch(1)
+
+    def _create_shape_configs(self, shapes_conf: Mapping[str, dict]) -> Dict[str, GrayShapeConfig]:
+        defaults = {
+            "square": ("正方形", 1200, 120000, 1.0, 1.2),
+            "rectangle": ("长方形", 1500, 180000, 1.2, 3.5),
+        }
+        shapes: Dict[str, GrayShapeConfig] = {}
+        for key, (label, min_area, max_area, min_aspect, max_aspect) in defaults.items():
+            data = shapes_conf.get(key, {}) or {}
+            cfg = GrayShapeConfig(
+                key=key,
+                label=label,
+                enabled=bool(data.get("enabled", True)),
+                min_area=int(data.get("min_area", min_area)),
+                max_area=int(data.get("max_area", max_area)),
+                min_aspect=float(data.get("min_aspect", min_aspect)) if data.get("min_aspect", min_aspect) is not None else None,
+                max_aspect=float(data.get("max_aspect", max_aspect)) if data.get("max_aspect", max_aspect) is not None else None,
+            )
+            shapes[key] = cfg
+        return shapes
+
+    def _create_shape_controls(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        if not self.shape_cfg_list:
+            return
+        group = QtWidgets.QGroupBox("形状检测")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        group_layout.setSpacing(10)
+        for cfg in self.shape_cfg_list:
+            container = QtWidgets.QFrame()
+            container_layout = QtWidgets.QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(4)
+
+            header = QtWidgets.QHBoxLayout()
+            cb = QtWidgets.QCheckBox(cfg.label)
+            cb.setChecked(cfg.enabled)
+            cb.toggled.connect(lambda state, key=cfg.key: self._on_shape_enabled(key, state))
+            header.addWidget(cb)
+            header.addStretch(1)
+            mask_btn = QtWidgets.QPushButton("掩膜")
+            mask_btn.clicked.connect(lambda _=0, label=cfg.label: self.toggle_mask(label))
+            header.addWidget(mask_btn)
+            container_layout.addLayout(header)
+
+            panel = QtWidgets.QFrame()
+            panel_layout = QtWidgets.QVBoxLayout(panel)
+            panel_layout.setContentsMargins(8, 4, 8, 4)
+            panel_layout.setSpacing(6)
+            for slider in self._build_shape_sliders(cfg):
+                panel_layout.addWidget(slider)
+            container_layout.addWidget(panel)
+
+            cfg.checkbox = cb
+            cfg.panel = panel
+            panel.setVisible(cfg.enabled)
+
+            group_layout.addWidget(container)
+
+        parent_layout.addWidget(group)
+
+    def _build_shape_sliders(self, cfg: GrayShapeConfig) -> List[ParamSlider]:
+        sliders: List[ParamSlider] = []
+
+        def clamp(value: float, mn: float, mx: float) -> float:
+            return max(mn, min(value, mx))
+
+        if cfg.key == "square":
+            specs = [
+                ("min_area", "最小面积", 600.0, 200000.0, float(cfg.min_area), 100.0, 0),
+                ("max_area", "最大面积", 2000.0, 400000.0, float(cfg.max_area), 100.0, 0),
+                ("max_aspect", "最大长宽比", 1.02, 1.5, float(cfg.max_aspect or 1.2), 0.01, 2),
+            ]
+        else:
+            specs = [
+                ("min_area", "最小面积", 800.0, 250000.0, float(cfg.min_area), 100.0, 0),
+                ("max_area", "最大面积", 4000.0, 500000.0, float(cfg.max_area), 100.0, 0),
+                ("min_aspect", "最小长宽比", 1.10, 3.0, float(cfg.min_aspect or 1.2), 0.01, 2),
+                ("max_aspect", "最大长宽比", 1.20, 5.0, float(cfg.max_aspect or 3.5), 0.01, 2),
+            ]
+
+        for name, text, mn, mx, val, step, decimals in specs:
+            slider = ParamSlider(text, mn, mx, clamp(val, mn, mx), step=step, decimals=decimals)
+            slider.valueChanged.connect(lambda _value, key=cfg.key: self._on_shape_slider_changed(key))
+            cfg.sliders[name] = slider
+            sliders.append(slider)
+
+        cfg.sync_from_sliders()
+        if self._ensure_shape_constraints(cfg):
+            cfg.sync_from_sliders()
+        return sliders
+
+    def _on_shape_enabled(self, key: str, enabled: bool) -> None:
+        cfg = self.shape_cfgs.get(key)
+        if not cfg:
+            return
+        cfg.enabled = bool(enabled)
+        if cfg.panel:
+            cfg.panel.setVisible(cfg.enabled)
+
+    def _on_shape_slider_changed(self, key: str) -> None:
+        cfg = self.shape_cfgs.get(key)
+        if not cfg:
+            return
+        cfg.sync_from_sliders()
+        if self._ensure_shape_constraints(cfg):
+            cfg.sync_from_sliders()
+
+    def _ensure_shape_constraints(self, cfg: GrayShapeConfig) -> bool:
+        updated = False
+        if cfg.max_area < cfg.min_area:
+            cfg.max_area = cfg.min_area
+            slider = cfg.sliders.get("max_area")
+            if slider:
+                slider.setValue(float(cfg.max_area))
+            updated = True
+        if cfg.min_aspect is not None:
+            min_allowed = 1.0 if cfg.key == "square" else 1.05
+            if cfg.min_aspect < min_allowed:
+                cfg.min_aspect = min_allowed
+                slider = cfg.sliders.get("min_aspect")
+                if slider:
+                    slider.setValue(float(cfg.min_aspect))
+                updated = True
+        if cfg.min_aspect is not None and cfg.max_aspect is not None:
+            min_gap = 0.02 if cfg.key == "square" else 0.05
+            if cfg.max_aspect < cfg.min_aspect + min_gap:
+                cfg.max_aspect = cfg.min_aspect + min_gap
+                slider = cfg.sliders.get("max_aspect")
+                if slider:
+                    slider.setValue(float(cfg.max_aspect))
+                updated = True
+        return updated
+
+    def _sync_all_shape_cfgs(self) -> None:
+        for cfg in self.shape_cfg_list:
+            cfg.sync_from_sliders()
+            if self._ensure_shape_constraints(cfg):
+                cfg.sync_from_sliders()
+
+    def _update_mask_windows(self, masks: Dict[str, np.ndarray]) -> None:
+        self.last_masks = masks
+        for label, window in list(self.mask_windows.items()):
+            if window.isVisible() and label in masks:
+                try:
+                    window.update_mask(masks[label])
+                except Exception as exc:
+                    self._append_status(f"[掩膜] 更新失败 {label}: {exc}")
+
+    def toggle_mask(self, label: str) -> None:
+        window = self.mask_windows.get(label)
+        if window and window.isVisible():
+            window.close()
+            return
+        if window is None:
+            window = MaskWindow(f"{label} 掩膜", self)
+            self.mask_windows[label] = window
+        mask = self.last_masks.get(label)
+        if mask is not None and mask.size:
+            try:
+                window.update_mask(mask)
+            except Exception as exc:
+                self._append_status(f"[掩膜] 更新失败 {label}: {exc}")
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _run_detection(self) -> List[GrayDetection]:
+        if self.last_frame_bgr is None:
+            return []
+        frame = self.last_frame_bgr.copy()
+        self._sync_all_shape_cfgs()
+        detections, masks = detect_gray_shapes(
+            frame,
+            self.shape_cfg_list,
+            merge_distance=self.merge_distance,
+            angle_tolerance=self.angle_tolerance,
+            approx_epsilon=self.approx_epsilon,
+        )
+        self.last_detections = detections
+        self._update_mask_windows(masks)
+        return detections
+
+    def _handle_recognition_request(self, manual: bool = False) -> None:
+        model = getattr(self, "modbus_model", None)
+        if model:
+            if manual:
+                model.set_register(0, 1)
+            self._publish_modbus_result([])
+
+        if self.last_frame_bgr is None:
+            self.msg_label.setText("未检测到目标")
+            self.msg_timer.start(2000)
+            self._publish_modbus_result(0xFF)
+            if model:
+                model.set_register(0, 0)
+            return
+
+        detections = self._run_detection()
+        if detections:
+            summary = self._format_summary(detections)
+            self.msg_label.setText(summary)
+            self.msg_timer.start(2000)
+            codes = [self.result_codes.get(det.label) for det in detections]
+            codes = [code for code in codes if code is not None]
+            if codes:
+                self._publish_modbus_result(codes)
+            else:
+                self._publish_modbus_result(0)
+        else:
+            self.msg_label.setText("未检测到目标")
+            self.msg_timer.start(2000)
+            self._publish_modbus_result(0xFF)
+
+        if model:
+            model.set_register(0, 0)
+
+    def _publish_modbus_result(self, values) -> None:
+        model = getattr(self, "modbus_model", None)
+        if not model:
+            return
+        if isinstance(values, int):
+            values_list = [values]
+        else:
+            values_list = list(values)
+        if not values_list:
+            values_list = [0]
+        sanitized = [int(v) & 0xFFFF for v in values_list]
+        if self._last_result_count > len(sanitized):
+            sanitized.extend([0] * (self._last_result_count - len(sanitized)))
+        model.write(RESULT_BASE_ADDR, sanitized)
+        self._last_result_count = len(sanitized)
+
+    def _update_modbus_status(self) -> None:
+        if self.modbus_server:
+            status = f"运行中: {self.modbus_host}:{self.modbus_port}"
+        elif self.modbus_error:
+            status = f"未启动: {self.modbus_error}"
+        else:
+            status = "未启动"
+        if hasattr(self, "modbus_status_lbl"):
+            self.modbus_status_lbl.setText(status)
+
+    def _refresh_modbus_ip(self) -> None:
+        if not hasattr(self, "modbus_ip_combo"):
+            return
+        entries = list(list_local_ipv4_addresses())
+        ips = [ip for ip, _ in entries]
+        if self.modbus_host not in ips:
+            entries.append((self.modbus_host, "当前"))
+        blocker = QtCore.QSignalBlocker(self.modbus_ip_combo)
+        self.modbus_ip_combo.clear()
+        for ip, name in entries:
+            text = f"{ip} ({name})" if name else ip
+            self.modbus_ip_combo.addItem(text, ip)
+        idx = self.modbus_ip_combo.findData(self.modbus_host)
+        if idx < 0 and self.modbus_ip_combo.count():
+            idx = 0
+        if idx >= 0:
+            self.modbus_ip_combo.setCurrentIndex(idx)
+        self._update_modbus_status()
+
+    def _on_modbus_ip_changed(self, index: int) -> None:
+        if index < 0 or not hasattr(self, "modbus_ip_combo"):
+            return
+        data = self.modbus_ip_combo.itemData(index)
+        host = str(data or self.modbus_ip_combo.itemText(index))
+        if host and host != self.modbus_host:
+            self._start_modbus_server(host)
+
+    def _stop_modbus_server(self) -> Optional[threading.Event]:
+        server = getattr(self, "modbus_server", None)
+        if not server:
+            return None
+
+        done = threading.Event()
+
+        def _shutdown():
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=_shutdown, daemon=True).start()
+        self.modbus_server = None
+        return done
+
+    def _start_modbus_server(self, host: Optional[str] = None) -> None:
+        if host:
+            self.modbus_host = host
+        shutdown_event = self._stop_modbus_server()
+        if shutdown_event:
+            shutdown_event.wait(1.0)
+        self.modbus_error = None
+        try:
+            self.modbus_server = start_modbus_server(
+                self.modbus_host,
+                self.modbus_port,
+                self.modbus_model,
+                on_write=self._on_modbus_write,
+            )
+        except Exception as exc:
+            self.modbus_server = None
+            self.modbus_error = str(exc)
+        self.config.setdefault("server", {})["host"] = self.modbus_host
+        self.config["server"]["port"] = self.modbus_port
+        self._update_modbus_status()
+        if hasattr(self, "modbus_ip_combo"):
+            self._refresh_modbus_ip()
+
+    def _on_modbus_write(self, addr: int, value: int) -> None:
+        if addr == 0 and value == 1:
+            self.modbus_trigger_sig.emit()
+
+    @QtCore.pyqtSlot()
+    def _on_modbus_trigger(self) -> None:
+        self._handle_recognition_request(manual=False)
 
     def start_camera(self, prefer_hik: bool = True) -> None:
         self.stop_camera()
@@ -242,8 +729,16 @@ class GrayMainWindow(QtWidgets.QWidget):
 
         self.last_frame_bgr = frame_bgr
         frame_draw = frame_bgr.copy()
-        detections = detect_gray_shapes(frame_draw)
+        self._sync_all_shape_cfgs()
+        detections, masks = detect_gray_shapes(
+            frame_draw,
+            self.shape_cfg_list,
+            merge_distance=self.merge_distance,
+            angle_tolerance=self.angle_tolerance,
+            approx_epsilon=self.approx_epsilon,
+        )
         self.last_detections = detections
+        self._update_mask_windows(masks)
 
         for det in detections:
             color = SHAPE_COLORS.get(det.label, (0, 255, 0))
@@ -276,14 +771,7 @@ class GrayMainWindow(QtWidgets.QWidget):
             self.msg_label.setText(self._format_summary(detections))
 
     def recognize_once(self) -> None:
-        if self.last_frame_bgr is None:
-            self.msg_label.setText("未检测到目标")
-            self.msg_timer.start(2000)
-            return
-        img = self.last_frame_bgr.copy()
-        detections = detect_gray_shapes(img)
-        self.msg_label.setText(self._format_summary(detections))
-        self.msg_timer.start(2000)
+        self._handle_recognition_request(manual=True)
 
     def _format_summary(self, detections: Sequence[GrayDetection]) -> str:
         if not detections:
@@ -306,15 +794,22 @@ class GrayMainWindow(QtWidgets.QWidget):
 
     def _on_camera_error(self, message: str) -> None:
         self._append_status(f"[ERROR] {message}")
-        self.msg_label.setText(message)
-        self.msg_timer.start(4000)
+        if isinstance(self.grabber, HikGrabber):
+            self.stop_camera()
+            self.start_camera(prefer_hik=False)
 
     def _append_status(self, text: str) -> None:
-        self.status_box.append(text)
-        self.status_box.moveCursor(QtGui.QTextCursor.End)
+        self._status_messages.append(text)
+        print(text)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # pragma: no cover - GUI 事件
         self.stop_camera()
+        if hasattr(self, "ip_refresh_timer"):
+            try:
+                self.ip_refresh_timer.stop()
+            except Exception:
+                pass
+        self._stop_modbus_server()
         super().closeEvent(event)
 
 
