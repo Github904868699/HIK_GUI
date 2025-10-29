@@ -135,6 +135,12 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     gray_cfg.setdefault("merge_distance", 12.0)
     gray_cfg.setdefault("angle_tolerance", 0.25)
     gray_cfg.setdefault("approx_epsilon", 0.03)
+    gray_cfg.setdefault("contrast_alpha", 1.0)
+    gray_cfg.setdefault("contrast_beta", 0.0)
+    gray_cfg.setdefault("clahe_clip", 0.0)
+    gray_cfg.setdefault("canny_low", 20.0)
+    gray_cfg.setdefault("canny_high", 160.0)
+    gray_cfg.setdefault("gradient_thresh", 10.0)
     return cfg
 
 

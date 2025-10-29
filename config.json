@@ -37,6 +37,9 @@
     "contrast_alpha": 1.0,
     "contrast_beta": 0.0,
     "clahe_clip": 0.0,
+    "canny_low": 20.0,
+    "canny_high": 160.0,
+    "gradient_thresh": 10.0,
     "shapes": {
       "square": {
         "enabled": true,

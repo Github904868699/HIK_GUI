@@ -169,7 +169,13 @@ def _prepare_gray(
     return processed
 
 
-def _iter_thresholds(gray: np.ndarray) -> Iterable[np.ndarray]:
+def _iter_thresholds(
+    gray: np.ndarray,
+    *,
+    canny_low: float,
+    canny_high: float,
+    gradient_thresh: float,
+) -> Iterable[np.ndarray]:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     kernel = np.ones((3, 3), np.uint8)
@@ -187,8 +193,22 @@ def _iter_thresholds(gray: np.ndarray) -> Iterable[np.ndarray]:
     yield cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=1)
     yield cv2.morphologyEx(cv2.bitwise_not(adaptive), cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    edges = cv2.Canny(blur, 40, 120)
+    low = max(1, int(round(min(canny_low, canny_high))))
+    high = max(low + 1, int(round(max(canny_low, canny_high))))
+    edges = cv2.Canny(blur, low, high)
     yield cv2.dilate(edges, kernel, iterations=1)
+
+    if gradient_thresh > 0:
+        grad = cv2.morphologyEx(blur, cv2.MORPH_GRADIENT, kernel)
+        _, grad_mask = cv2.threshold(
+            grad,
+            max(1, float(gradient_thresh)),
+            255,
+            cv2.THRESH_BINARY,
+        )
+        grad_mask = cv2.dilate(grad_mask, kernel, iterations=1)
+        grad_mask = cv2.morphologyEx(grad_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        yield grad_mask
 
 
 def detect_gray_shapes(
@@ -201,6 +221,9 @@ def detect_gray_shapes(
     contrast_alpha: float = 1.0,
     contrast_beta: float = 0.0,
     clahe_clip_limit: float = 0.0,
+    canny_low: float = 20.0,
+    canny_high: float = 160.0,
+    gradient_thresh: float = 10.0,
 ) -> Tuple[List[GrayDetection], Dict[str, np.ndarray]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = _prepare_gray(
@@ -217,7 +240,12 @@ def detect_gray_shapes(
         if cfg.enabled:
             masks[cfg.label] = np.zeros((height, width), dtype=np.uint8)
 
-    for mask in _iter_thresholds(gray):
+    for mask in _iter_thresholds(
+        gray,
+        canny_low=canny_low,
+        canny_high=canny_high,
+        gradient_thresh=gradient_thresh,
+    ):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -280,6 +308,12 @@ class GrayMainWindow(QtWidgets.QWidget):
         self.contrast_alpha = float(gray_section.get("contrast_alpha", 1.0))
         self.contrast_beta = float(gray_section.get("contrast_beta", 0.0))
         self.clahe_clip = float(gray_section.get("clahe_clip", 0.0))
+        self.canny_low = float(gray_section.get("canny_low", 20.0))
+        self.canny_high = float(gray_section.get("canny_high", 160.0))
+        self.gradient_thresh = float(gray_section.get("gradient_thresh", 10.0))
+        if self.canny_high <= self.canny_low:
+            self.canny_high = self.canny_low + 20.0
+        self.gradient_thresh = max(0.0, self.gradient_thresh)
 
         self.result_codes = result_codes_from_cmd_map(self.config.get("cmd_map", {}))
 
@@ -389,6 +423,7 @@ class GrayMainWindow(QtWidgets.QWidget):
 
         self._create_shape_controls(vbox)
         self._create_preprocess_controls(vbox)
+        self._create_edge_controls(vbox)
 
         g_modbus = QtWidgets.QGroupBox("Modbus")
         form = QtWidgets.QFormLayout(g_modbus)
@@ -500,6 +535,42 @@ class GrayMainWindow(QtWidgets.QWidget):
 
         parent_layout.addWidget(group)
 
+    def _create_edge_controls(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("边缘增强")
+        layout = QtWidgets.QVBoxLayout(group)
+
+        self.canny_low_slider = ParamSlider(
+            "边缘下限",
+            1.0,
+            150.0,
+            self.canny_low,
+            step=1.0,
+        )
+        self.canny_low_slider.valueChanged.connect(self._on_canny_low_changed)
+        layout.addWidget(self.canny_low_slider)
+
+        self.canny_high_slider = ParamSlider(
+            "边缘上限",
+            10.0,
+            255.0,
+            self.canny_high,
+            step=1.0,
+        )
+        self.canny_high_slider.valueChanged.connect(self._on_canny_high_changed)
+        layout.addWidget(self.canny_high_slider)
+
+        self.gradient_slider = ParamSlider(
+            "梯度阈值",
+            0.0,
+            80.0,
+            self.gradient_thresh,
+            step=1.0,
+        )
+        self.gradient_slider.valueChanged.connect(self._on_gradient_thresh_changed)
+        layout.addWidget(self.gradient_slider)
+
+        parent_layout.addWidget(group)
+
     def _update_gray_config(self, key: str, value: float) -> None:
         gray_section = self.config.setdefault("gray_shapes", {})
         gray_section[key] = value
@@ -515,6 +586,24 @@ class GrayMainWindow(QtWidgets.QWidget):
     def _on_clahe_changed(self, value: float) -> None:
         self.clahe_clip = max(0.0, float(value))
         self._update_gray_config("clahe_clip", self.clahe_clip)
+
+    def _on_canny_low_changed(self, value: float) -> None:
+        new_val = max(1.0, min(float(value), self.canny_high - 1.0))
+        if abs(new_val - float(value)) > 1e-6 and hasattr(self, "canny_low_slider"):
+            self.canny_low_slider.setValue(new_val)
+        self.canny_low = new_val
+        self._update_gray_config("canny_low", self.canny_low)
+
+    def _on_canny_high_changed(self, value: float) -> None:
+        new_val = max(self.canny_low + 1.0, float(value))
+        if abs(new_val - float(value)) > 1e-6 and hasattr(self, "canny_high_slider"):
+            self.canny_high_slider.setValue(new_val)
+        self.canny_high = new_val
+        self._update_gray_config("canny_high", self.canny_high)
+
+    def _on_gradient_thresh_changed(self, value: float) -> None:
+        self.gradient_thresh = max(0.0, float(value))
+        self._update_gray_config("gradient_thresh", self.gradient_thresh)
 
     def _build_shape_sliders(self, cfg: GrayShapeConfig) -> List[ParamSlider]:
         sliders: List[ParamSlider] = []
@@ -636,6 +725,9 @@ class GrayMainWindow(QtWidgets.QWidget):
             contrast_alpha=self.contrast_alpha,
             contrast_beta=self.contrast_beta,
             clahe_clip_limit=self.clahe_clip,
+            canny_low=self.canny_low,
+            canny_high=self.canny_high,
+            gradient_thresh=self.gradient_thresh,
         )
         self.last_detections = detections
         self._update_mask_windows(masks)
@@ -828,6 +920,9 @@ class GrayMainWindow(QtWidgets.QWidget):
             contrast_alpha=self.contrast_alpha,
             contrast_beta=self.contrast_beta,
             clahe_clip_limit=self.clahe_clip,
+            canny_low=self.canny_low,
+            canny_high=self.canny_high,
+            gradient_thresh=self.gradient_thresh,
         )
         self.last_detections = detections
         self._update_mask_windows(masks)
