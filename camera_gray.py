@@ -175,6 +175,10 @@ def _iter_thresholds(
     canny_low: float,
     canny_high: float,
     gradient_thresh: float,
+    use_kmeans: bool,
+    kmeans_downscale: int,
+    kmeans_blur: int,
+    kmeans_morph: int,
 ) -> Iterable[np.ndarray]:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -210,6 +214,74 @@ def _iter_thresholds(
         grad_mask = cv2.morphologyEx(grad_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         yield grad_mask
 
+    if use_kmeans:
+        yield from _kmeans_masks(
+            gray,
+            downscale=kmeans_downscale,
+            blur_kernel=kmeans_blur,
+            morph_iterations=kmeans_morph,
+        )
+
+
+def _kmeans_masks(
+    gray: np.ndarray,
+    *,
+    downscale: int,
+    blur_kernel: int,
+    morph_iterations: int,
+) -> Iterable[np.ndarray]:
+    height, width = gray.shape
+    scale = max(1, int(round(downscale)))
+    if scale > 1:
+        small_w = max(1, int(round(width / scale)))
+        small_h = max(1, int(round(height / scale)))
+        small = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    else:
+        small = gray
+
+    kernel_size = int(round(blur_kernel))
+    if kernel_size % 2 == 0:
+        kernel_size = max(1, kernel_size - 1)
+    if kernel_size >= 3:
+        small = cv2.GaussianBlur(small, (kernel_size, kernel_size), 0)
+
+    data = small.reshape((-1, 1)).astype(np.float32)
+    if data.size < 2:
+        return
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 15, 1.0)
+    try:
+        _compact, labels, centers = cv2.kmeans(
+            data,
+            2,
+            None,
+            criteria,
+            3,
+            cv2.KMEANS_PP_CENTERS,
+        )
+    except cv2.error:
+        return
+
+    labels = labels.reshape(small.shape)
+    centers = centers.flatten()
+    order = np.argsort(centers)
+    base_kernel = np.ones((3, 3), np.uint8)
+
+    for idx in order:
+        mask_small = np.zeros_like(small, dtype=np.uint8)
+        mask_small[labels == idx] = 255
+        if morph_iterations > 0:
+            mask_small = cv2.morphologyEx(
+                mask_small,
+                cv2.MORPH_CLOSE,
+                base_kernel,
+                iterations=int(morph_iterations),
+            )
+        mask = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST)
+        if cv2.countNonZero(mask) == 0:
+            continue
+        yield mask
+
 
 def detect_gray_shapes(
     frame_bgr: np.ndarray,
@@ -224,6 +296,10 @@ def detect_gray_shapes(
     canny_low: float = 20.0,
     canny_high: float = 160.0,
     gradient_thresh: float = 10.0,
+    kmeans_enabled: bool = False,
+    kmeans_downscale: int = 1,
+    kmeans_blur: int = 3,
+    kmeans_morph: int = 1,
 ) -> Tuple[List[GrayDetection], Dict[str, np.ndarray]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = _prepare_gray(
@@ -245,6 +321,10 @@ def detect_gray_shapes(
         canny_low=canny_low,
         canny_high=canny_high,
         gradient_thresh=gradient_thresh,
+        use_kmeans=kmeans_enabled,
+        kmeans_downscale=kmeans_downscale,
+        kmeans_blur=kmeans_blur,
+        kmeans_morph=kmeans_morph,
     ):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
@@ -314,6 +394,12 @@ class GrayMainWindow(QtWidgets.QWidget):
         if self.canny_high <= self.canny_low:
             self.canny_high = self.canny_low + 20.0
         self.gradient_thresh = max(0.0, self.gradient_thresh)
+        self.kmeans_enabled = bool(gray_section.get("kmeans_enabled", True))
+        self.kmeans_downscale = max(1, int(round(gray_section.get("kmeans_downscale", 2))))
+        self.kmeans_blur = max(1, int(round(gray_section.get("kmeans_blur", 5))))
+        if self.kmeans_blur % 2 == 0:
+            self.kmeans_blur += 1
+        self.kmeans_morph = max(0, int(round(gray_section.get("kmeans_morph", 2))))
 
         self.result_codes = result_codes_from_cmd_map(self.config.get("cmd_map", {}))
 
@@ -424,6 +510,7 @@ class GrayMainWindow(QtWidgets.QWidget):
         self._create_shape_controls(vbox)
         self._create_preprocess_controls(vbox)
         self._create_edge_controls(vbox)
+        self._create_segmentation_controls(vbox)
 
         g_modbus = QtWidgets.QGroupBox("Modbus")
         form = QtWidgets.QFormLayout(g_modbus)
@@ -571,7 +658,56 @@ class GrayMainWindow(QtWidgets.QWidget):
 
         parent_layout.addWidget(group)
 
-    def _update_gray_config(self, key: str, value: float) -> None:
+    def _create_segmentation_controls(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("区域分割")
+        layout = QtWidgets.QVBoxLayout(group)
+
+        self.kmeans_checkbox = QtWidgets.QCheckBox("启用K-means分割")
+        self.kmeans_checkbox.setChecked(self.kmeans_enabled)
+        self.kmeans_checkbox.stateChanged.connect(self._on_kmeans_enabled_changed)
+        layout.addWidget(self.kmeans_checkbox)
+
+        self.kmeans_downscale_slider = ParamSlider(
+            "取样缩放",
+            1.0,
+            4.0,
+            float(self.kmeans_downscale),
+            step=1.0,
+        )
+        self.kmeans_downscale_slider.valueChanged.connect(self._on_kmeans_downscale_changed)
+        layout.addWidget(self.kmeans_downscale_slider)
+
+        self.kmeans_blur_slider = ParamSlider(
+            "平滑核",
+            1.0,
+            11.0,
+            float(self.kmeans_blur),
+            step=2.0,
+        )
+        self.kmeans_blur_slider.valueChanged.connect(self._on_kmeans_blur_changed)
+        layout.addWidget(self.kmeans_blur_slider)
+
+        self.kmeans_morph_slider = ParamSlider(
+            "闭运算次数",
+            0.0,
+            5.0,
+            float(self.kmeans_morph),
+            step=1.0,
+        )
+        self.kmeans_morph_slider.valueChanged.connect(self._on_kmeans_morph_changed)
+        layout.addWidget(self.kmeans_morph_slider)
+
+        controls = [
+            self.kmeans_downscale_slider,
+            self.kmeans_blur_slider,
+            self.kmeans_morph_slider,
+        ]
+        for ctrl in controls:
+            ctrl.setEnabled(self.kmeans_enabled)
+
+        parent_layout.addWidget(group)
+
+    def _update_gray_config(self, key: str, value: object) -> None:
         gray_section = self.config.setdefault("gray_shapes", {})
         gray_section[key] = value
 
@@ -604,6 +740,39 @@ class GrayMainWindow(QtWidgets.QWidget):
     def _on_gradient_thresh_changed(self, value: float) -> None:
         self.gradient_thresh = max(0.0, float(value))
         self._update_gray_config("gradient_thresh", self.gradient_thresh)
+
+    def _on_kmeans_enabled_changed(self, state: int) -> None:
+        enabled = state == QtCore.Qt.Checked
+        self.kmeans_enabled = enabled
+        for ctrl in (
+            getattr(self, "kmeans_downscale_slider", None),
+            getattr(self, "kmeans_blur_slider", None),
+            getattr(self, "kmeans_morph_slider", None),
+        ):
+            if ctrl is not None:
+                ctrl.setEnabled(enabled)
+        self._update_gray_config("kmeans_enabled", enabled)
+
+    def _on_kmeans_downscale_changed(self, value: float) -> None:
+        downscale = max(1, int(round(value)))
+        self.kmeans_downscale = downscale
+        self._update_gray_config("kmeans_downscale", downscale)
+
+    def _on_kmeans_blur_changed(self, value: float) -> None:
+        kernel = max(1, int(round(value)))
+        if kernel % 2 == 0:
+            kernel = max(1, kernel - 1)
+        if hasattr(self, "kmeans_blur_slider"):
+            current = self.kmeans_blur_slider.value()
+            if int(round(current)) != kernel:
+                self.kmeans_blur_slider.setValue(float(kernel))
+        self.kmeans_blur = kernel
+        self._update_gray_config("kmeans_blur", kernel)
+
+    def _on_kmeans_morph_changed(self, value: float) -> None:
+        morph = max(0, int(round(value)))
+        self.kmeans_morph = morph
+        self._update_gray_config("kmeans_morph", morph)
 
     def _build_shape_sliders(self, cfg: GrayShapeConfig) -> List[ParamSlider]:
         sliders: List[ParamSlider] = []
@@ -728,6 +897,10 @@ class GrayMainWindow(QtWidgets.QWidget):
             canny_low=self.canny_low,
             canny_high=self.canny_high,
             gradient_thresh=self.gradient_thresh,
+            kmeans_enabled=self.kmeans_enabled,
+            kmeans_downscale=self.kmeans_downscale,
+            kmeans_blur=self.kmeans_blur,
+            kmeans_morph=self.kmeans_morph,
         )
         self.last_detections = detections
         self._update_mask_windows(masks)
@@ -923,6 +1096,10 @@ class GrayMainWindow(QtWidgets.QWidget):
             canny_low=self.canny_low,
             canny_high=self.canny_high,
             gradient_thresh=self.gradient_thresh,
+            kmeans_enabled=self.kmeans_enabled,
+            kmeans_downscale=self.kmeans_downscale,
+            kmeans_blur=self.kmeans_blur,
+            kmeans_morph=self.kmeans_morph,
         )
         self.last_detections = detections
         self._update_mask_windows(masks)

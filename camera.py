@@ -141,6 +141,10 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     gray_cfg.setdefault("canny_low", 20.0)
     gray_cfg.setdefault("canny_high", 160.0)
     gray_cfg.setdefault("gradient_thresh", 10.0)
+    gray_cfg.setdefault("kmeans_enabled", True)
+    gray_cfg.setdefault("kmeans_downscale", 2)
+    gray_cfg.setdefault("kmeans_blur", 5)
+    gray_cfg.setdefault("kmeans_morph", 2)
     return cfg
 
 

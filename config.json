@@ -40,6 +40,10 @@
     "canny_low": 20.0,
     "canny_high": 160.0,
     "gradient_thresh": 10.0,
+    "kmeans_enabled": true,
+    "kmeans_downscale": 2,
+    "kmeans_blur": 5,
+    "kmeans_morph": 2,
     "shapes": {
       "square": {
         "enabled": true,
