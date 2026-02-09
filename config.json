@@ -1,9 +1,11 @@
 {
-  "server": { "host": "169.254.69.10", "port": 9760 },
+  "server": { "host": "0.0.0.0", "port": 502 },
   "cmd_map": {
-    "金色-圆形": "{\"dsID\":\"www.hc-system.com.RemoteMonitor\",\"reqType\":\"command\",\"packID\":\"0\",\"cmdData\":[\"modifyOutput\",\"0\",\"27\",\"1\"]}",
-    "散热片-正方形": "{\"dsID\":\"www.hc-system.com.RemoteMonitor\",\"reqType\":\"command\",\"packID\":\"0\",\"cmdData\":[\"modifyOutput\",\"0\",\"28\",\"1\"]}",
-    "木头-正方形": "{\"dsID\":\"www.hc-system.com.RemoteMonitor\",\"reqType\":\"command\",\"packID\":\"0\",\"cmdData\":[\"modifyOutput\",\"0\",\"26\",\"1\"]}"
+    "正方形": "0x21",
+    "长方形": "0x22",
+    "金色-圆形": "0x11",
+    "木头-正方形": "0x12",
+    "散热片-正方形": "0x13"
   },
   "colors": [
     {
@@ -11,21 +13,42 @@
       "bgr": [255, 0, 0],
       "lower": [103, 88, 0],
       "upper": [142, 249, 255],
-      "shapes": { "circle": false, "triangle": false, "rect": true }
+      "shapes": { "circle": false, "triangle": false, "rect": true, "rect_long": false }
     },
     {
       "name": "金色",
       "bgr": [0, 215, 255],
       "lower": [10, 68, 0],
       "upper": [25, 255, 255],
-      "shapes": { "circle": true, "triangle": false, "rect": false }
+      "shapes": { "circle": true, "triangle": false, "rect": false, "rect_long": false }
     },
     {
       "name": "木头",
       "bgr": [19, 69, 139],
       "lower": [8, 50, 78],
       "upper": [18, 192, 177],
-      "shapes": { "circle": false, "triangle": false, "rect": true }
+      "shapes": { "circle": false, "triangle": false, "rect": true, "rect_long": false }
     }
-  ]
+  ],
+  "gray_shapes": {
+    "merge_distance": 12.0,
+    "angle_tolerance": 0.25,
+    "approx_epsilon": 0.03,
+    "shapes": {
+      "square": {
+        "enabled": true,
+        "min_area": 1200,
+        "max_area": 120000,
+        "min_aspect": 1.0,
+        "max_aspect": 1.2
+      },
+      "rectangle": {
+        "enabled": true,
+        "min_area": 1500,
+        "max_area": 180000,
+        "min_aspect": 1.2,
+        "max_aspect": 3.5
+      }
+    }
+  }
 }

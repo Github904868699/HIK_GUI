@@ -1,68 +1,80 @@
 # -*- coding: utf-8 -*-
 import os, sys
 from pathlib import Path
-import os, sys
-from pathlib import Path
+import struct
+import ctypes
 
-def add_mvs_runtime_from_system():
-    # 常见安装位置（64 位）
-    candidates = [
-        Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"),
-        Path(r"C:\Program Files\Common Files\MVS\Runtime\Win64_x64"),
-    ]
-    for p in candidates:
-        if p.exists():
-            # Python 3.8+ 正确做法：把目录加入本进程 DLL 搜索路径
-            if hasattr(os, "add_dll_directory"):
-                os.add_dll_directory(str(p))   # 影响本进程的 DLL 搜索
-            # 兜底再拼到 PATH（部分三方仍依赖）
-            os.environ["PATH"] = str(p) + os.pathsep + os.environ.get("PATH", "")
-            return True
-    return False
-
-if getattr(sys, "frozen", False):
-    add_mvs_runtime_from_system()
-
-
-from MvCameraControl_class import *  # 或你的实际导入
-
+from ctypes import POINTER, byref, cast, c_ubyte
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
 import cv2
-import ctypes, json, socket, socketserver, sys, threading, time
-from MvCameraControl_class import (
-    MvCamera,
-    MV_CC_DEVICE_INFO_LIST, MV_CC_DEVICE_INFO,
-    MVCC_INTVALUE, MVCC_ENUMVALUE, MV_FRAME_OUT_INFO_EX,
-    MV_CC_PIXEL_CONVERT_PARAM,
-)
-import MvCameraControl_class as mv
-from CameraParams_header import *
-from PixelType_header import *
+import json, socket, socketserver, threading, time
 
-MV_ACCESS_EXCLUSIVE       = getattr(mv, "MV_ACCESS_Exclusive", 1)
-MV_GIGE_DEVICE_SAFE       = getattr(mv, "MV_GIGE_DEVICE", 1)
-MV_TRIGGER_MODE_OFF_SAFE  = getattr(mv, "MV_TRIGGER_MODE_OFF", 0)
-MV_TRIGGER_MODE_ON_SAFE   = getattr(mv, "MV_TRIGGER_MODE_ON", 1)
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - 运行环境可能缺少 psutil
+    psutil = None  # type: ignore
 
 CONFIG_PATH = "config.json"
 TARGET_DISPLAY_WIDTH = 1280
 UI_TARGET_FPS = 15.0
 UI_PAINT_FPS = 12.0
-CAMERA_INIT_FPS = 5.0
-CAM_THROUGHPUT_MBPS = 80
-GIGE_PACKET_DELAY = 8000
+RESULT_BASE_ADDR = 1  # 对应保持寄存器 40002
 
 APP_TITLE = "HIK MVS"
 APP_ICON  = "Camera.ico"
-CHS = {"circle": "圆形", "triangle": "三角形", "rect": "正方形"}
+CHS = {"circle": "圆形", "triangle": "三角形", "rect": "正方形", "rect_long": "长方形"}
 MIN_AREA, MAX_AREA = 500, 300_000
 FPS_CALC_INTERVAL  = 30
-HEARTBEAT_DS_ID    = "www.hc-system.com.cam"
+
+try:
+    from MvCameraControl_class import MvCamera
+    from CameraParams_header import (
+        MV_CC_DEVICE_INFO,
+        MV_CC_DEVICE_INFO_LIST,
+        MV_FRAME_OUT_INFO_EX,
+        MVCC_INTVALUE,
+        MV_CC_PIXEL_CONVERT_PARAM,
+    )
+    from CameraParams_const import MV_GIGE_DEVICE, MV_ACCESS_Exclusive
+    from PixelType_header import (
+        PixelType_Gvsp_BGR8_Packed,
+        PixelType_Gvsp_RGB8_Packed,
+        PixelType_Gvsp_Mono8,
+        PixelType_Gvsp_BayerRG8,
+        PixelType_Gvsp_BayerBG8,
+        PixelType_Gvsp_BayerGB8,
+        PixelType_Gvsp_BayerGR8,
+        PixelType_Gvsp_YUV422_Packed,
+        PixelType_Gvsp_YUV422_YUYV_Packed,
+    )
+    from MvErrorDefine_const import MV_OK
+    HIK_SDK_AVAILABLE = True
+    HIK_SDK_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - 平台可能缺少 SDK
+    MvCamera = None  # type: ignore[assignment]
+    MV_CC_DEVICE_INFO = None  # type: ignore[assignment]
+    MV_CC_DEVICE_INFO_LIST = None  # type: ignore[assignment]
+    MV_FRAME_OUT_INFO_EX = None  # type: ignore[assignment]
+    MVCC_INTVALUE = None  # type: ignore[assignment]
+    MV_CC_PIXEL_CONVERT_PARAM = None  # type: ignore[assignment]
+    MV_GIGE_DEVICE = 0  # type: ignore[assignment]
+    MV_ACCESS_Exclusive = 1  # type: ignore[assignment]
+    PixelType_Gvsp_BGR8_Packed = 0  # type: ignore[assignment]
+    PixelType_Gvsp_RGB8_Packed = 0  # type: ignore[assignment]
+    PixelType_Gvsp_Mono8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerRG8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerBG8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerGB8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_BayerGR8 = 0  # type: ignore[assignment]
+    PixelType_Gvsp_YUV422_Packed = 0  # type: ignore[assignment]
+    PixelType_Gvsp_YUV422_YUYV_Packed = 0  # type: ignore[assignment]
+    MV_OK = 0  # type: ignore[assignment]
+    HIK_SDK_AVAILABLE = False
+    HIK_SDK_IMPORT_ERROR = exc
 
 def resource_path(rel: str) -> str:
     base = getattr(sys, "_MEIPASS", Path(__file__).parent)
@@ -94,19 +106,80 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     cfg = safe_load_json(path, default=None)
     if not cfg:
         cfg = {
-            "server": {"host": "127.0.0.1", "port": 6000},
+            "server": {"host": "0.0.0.0", "port": 502},
             "cmd_map": {
             },
             "colors": [
-                
+
             ]
         }
     if isinstance(cfg, list):
-        cfg = {"server": {"host":"127.0.0.1","port":6000}, "cmd_map": {}, "colors": cfg}
-    cfg.setdefault("server", {"host": "127.0.0.1", "port": 6000})
+        cfg = {"server": {"host":"0.0.0.0","port":502}, "cmd_map": {}, "colors": cfg}
+    cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("cmd_map", {})
     cfg.setdefault("colors", [])
+    gray_cfg = cfg.setdefault("gray_shapes", {})
+    shapes = gray_cfg.setdefault("shapes", {})
+    square = shapes.setdefault("square", {})
+    square.setdefault("enabled", True)
+    square.setdefault("min_area", 1200)
+    square.setdefault("max_area", 120000)
+    square.setdefault("min_aspect", 1.0)
+    square.setdefault("max_aspect", 1.2)
+    rect = shapes.setdefault("rectangle", {})
+    rect.setdefault("enabled", True)
+    rect.setdefault("min_area", 1500)
+    rect.setdefault("max_area", 180000)
+    rect.setdefault("min_aspect", 1.2)
+    rect.setdefault("max_aspect", 3.5)
+    gray_cfg.setdefault("merge_distance", 12.0)
+    gray_cfg.setdefault("angle_tolerance", 0.25)
+    gray_cfg.setdefault("approx_epsilon", 0.03)
     return cfg
+
+
+def get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
+def list_local_ipv4_addresses() -> List[Tuple[str, str]]:
+    addresses: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+
+    if psutil is not None:
+        try:
+            for iface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        if ip and not ip.startswith("127.") and ip not in seen:
+                            addresses.append((ip, iface))
+                            seen.add(ip)
+        except Exception:
+            pass
+
+    hostname = socket.gethostname()
+    try:
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if ip and not ip.startswith("127.") and ip not in seen:
+                addresses.append((ip, hostname))
+                seen.add(ip)
+    except Exception:
+        pass
+
+    if not addresses:
+        ip = get_local_ip()
+        addresses.append((ip, ""))
+
+    return addresses
 
 @dataclass
 class ColorCfg:
@@ -140,9 +213,52 @@ def colors_from_config(cfg: dict) -> List[ColorCfg]:
                 "circle": bool(shapes.get("circle", True)),
                 "triangle": bool(shapes.get("triangle", True)),
                 "rect": bool(shapes.get("rect", True)),
+                "rect_long": bool(shapes.get("rect_long", True)),
             }
         ))
     return colors
+
+def _parse_cmd_code(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped, 0)
+        except ValueError:
+            return None
+    return None
+
+
+def result_codes_from_cmd_map(cmd_map: dict) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for label, value in cmd_map.items():
+        code = _parse_cmd_code(value)
+        if code is not None:
+            out[label] = code
+            continue
+        parsed = None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    print(f"[MODBUS] 忽略无法解析的 cmd_map 项: {label}")
+                    continue
+        elif isinstance(value, dict):
+            parsed = value
+        if isinstance(parsed, dict):
+            code = _parse_cmd_code(parsed.get("code"))
+            if code is not None:
+                out[label] = code
+            else:
+                print(f"[MODBUS] cmd_map 项 {label} 缺少 'code' 数值，已忽略")
+        elif value is not None:
+            print(f"[MODBUS] cmd_map 项 {label} 类型不支持，已忽略")
+    return out
 
 class HSVSlider(QtWidgets.QWidget):
     valueChanged = QtCore.pyqtSignal(int)
@@ -174,145 +290,154 @@ class MaskWindow(QtWidgets.QWidget):
         ); self.label.setPixmap(pix)
 
 # TCP
-class HCRequestHandler(socketserver.BaseRequestHandler):
+class ModbusRegisterModel:
+    def __init__(self, size: int = 16):
+        self._lock = threading.Lock()
+        self._regs = [0] * max(size, 2)
+
+    def read(self, addr: int, count: int) -> List[int]:
+        with self._lock:
+            if addr < 0:
+                return [0] * max(count, 0)
+            end = addr + count
+            slice_regs = self._regs[addr:end]
+            if len(slice_regs) < count:
+                slice_regs.extend([0] * (count - len(slice_regs)))
+            return list(slice_regs)
+
+    def write(self, addr: int, values: List[int]):
+        if addr < 0:
+            return
+        with self._lock:
+            end = addr + len(values)
+            if end > len(self._regs):
+                self._regs.extend([0] * (end - len(self._regs)))
+            for i, v in enumerate(values):
+                self._regs[addr + i] = v & 0xFFFF
+
+    def set_register(self, addr: int, value: int):
+        self.write(addr, [value])
+
+
+class ModbusRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        # 兼容：既支持 NDJSON（行分隔）也支持无换行的单个 JSON 对象
-        buf = ""
-        decoder = json.JSONDecoder()
         while True:
-            data = self.request.recv(4096)
-            if not data:
-                # 连接结束前尽量把缓冲区里完整的 JSON 吃掉
-                buf = buf.strip()
-                if buf:
-                    buf = self._consume_json_objects(decoder, buf)
+            header = self._recvn(7)
+            if not header:
+                break
+            try:
+                tid, pid, length = struct.unpack(">HHH", header[:6])
+            except struct.error:
+                break
+            unit = header[6]
+            if length <= 0:
+                continue
+            payload = self._recvn(length - 1)
+            if payload is None:
+                break
+            if not payload:
+                continue
+            function = payload[0]
+            data = payload[1:]
+            response_pdu = self._handle_function(function, data)
+            if response_pdu is None:
+                continue
+            mbap = struct.pack(">HHHB", tid, 0, len(response_pdu) + 1, unit)
+            try:
+                self.request.sendall(mbap + response_pdu)
+            except Exception:
                 break
 
-            try:
-                chunk = data.decode("utf-8", errors="ignore")
-            except Exception:
-                continue
+    def _recvn(self, size: int):
+        buf = b""
+        while len(buf) < size:
+            chunk = self.request.recv(size - len(buf))
+            if not chunk:
+                return None if not buf else buf
             buf += chunk
+        return buf
 
-            # 1) 先处理带换行的（向后兼容）
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if line:
-                    self.server.on_message(line)
+    def _handle_function(self, function: int, data: bytes) -> bytes | None:
+        try:
+            if function == 3:  # Read Holding Registers
+                if len(data) < 4:
+                    raise ValueError
+                addr, count = struct.unpack(">HH", data[:4])
+                regs = self.server.model.read(addr, count)
+                payload = struct.pack(">B", len(regs) * 2)
+                if regs:
+                    payload += struct.pack(">" + "H" * len(regs), *regs)
+                return bytes([function]) + payload
+            elif function == 6:  # Write Single Register
+                if len(data) < 4:
+                    raise ValueError
+                addr, value = struct.unpack(">HH", data[:4])
+                self.server.model.write(addr, [value])
+                if self.server.on_write:
+                    self.server.on_write(addr, value & 0xFFFF)
+                return bytes([function]) + data[:4]
+            elif function == 16:  # Write Multiple Registers
+                if len(data) < 5:
+                    raise ValueError
+                addr, count, byte_count = struct.unpack(">HHB", data[:5])
+                expected = count * 2
+                if byte_count != expected or len(data[5:]) < expected:
+                    raise ValueError
+                raw = data[5:5 + expected]
+                values = list(struct.unpack(">" + "H" * count, raw))
+                self.server.model.write(addr, values)
+                if self.server.on_write:
+                    for i, v in enumerate(values):
+                        self.server.on_write(addr + i, v & 0xFFFF)
+                return bytes([function]) + struct.pack(">HH", addr, count)
+            else:
+                return bytes([function | 0x80, 1])
+        except Exception:
+            return bytes([function | 0x80, 3])
 
-            # 2) 再处理不带换行的完整 JSON（可连续多个）
-            buf = self._consume_json_objects(decoder, buf)
 
-    def _consume_json_objects(self, decoder, text):
-        # 尝试从开头 raw_decode 一个完整 JSON；成功就回调并剥离，失败说明数据还不完整
-        s = text.lstrip()
-        consumed_prefix = len(text) - len(s)
-        idx = 0
-        while s:
-            try:
-                obj, end = decoder.raw_decode(s, idx)
-            except ValueError:
-                break  # 不够组成完整 JSON，等下次 recv
-            raw = s[idx:end].strip()
-            if raw:
-                self.server.on_message(raw)
-            s = s[end:].lstrip()
-            idx = 0
-        return text[:consumed_prefix] + s
-
-
-class HCVisionServer(socketserver.ThreadingTCPServer):
+class ModbusTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
-    def __init__(self, host, port, on_message):
-        self.on_message = on_message
-        super().__init__((host, port), HCRequestHandler)
+    daemon_threads = True
 
-def start_server(host="0.0.0.0", port=9760, on_message=lambda x: None):
-    svr = HCVisionServer(host, port, on_message)
-    threading.Thread(target=svr.serve_forever, daemon=True).start()
-    print(f"[TCP-SVR] listen on {host}:{port}")
-    return svr
+    def __init__(self, host: str, port: int, model: ModbusRegisterModel, on_write=None):
+        self.model = model
+        self.on_write = on_write
+        super().__init__((host, port), ModbusRequestHandler)
 
-class TcpSender:
-    def __init__(self, ip: str, port: int, on_recv=None):
-        self.sock = socket.create_connection((ip, port), timeout=5)
-        self.sock.settimeout(None)
-        self.on_recv = on_recv
-        threading.Thread(target=self._recv_loop, daemon=True).start()
-    
-    def _recv_loop(self):
-            # Support both NDJSON (newline-delimited) and standalone JSON without trailing newline.
-            str_buf = ""
-            decoder = json.JSONDecoder()
-            bs_buf = b""
-            while True:
-                try:
-                    data = self.sock.recv(4096)
-                    if not data:
-                        # flush any remaining complete JSON
-                        str_buf = str_buf.strip()
-                        if str_buf:
-                            str_buf = self._consume_json_objects(decoder, str_buf)
-                        break
-    
-                    # accumulate bytes
-                    bs_buf += data
-    
-                    # 1) Backward compatible: process NDJSON lines first
-                    while b"\n" in bs_buf:
-                        line, bs_buf = bs_buf.split(b"\n", 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            txt = line.decode("utf-8", errors="ignore")
-                        except Exception:
-                            continue
-                        if self.on_recv:
-                            self.on_recv(txt)
-    
-                    # 2) Then try to parse complete JSON objects from remainder (no newline case)
-                    try:
-                        chunk = bs_buf.decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-                    str_buf += chunk
-                    bs_buf = b""
-                    str_buf = self._consume_json_objects(decoder, str_buf)
-    
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-    
-    def _consume_json_objects(self, decoder, text):
-            s = text.lstrip()
-            consumed_prefix = len(text) - len(s)
-            idx = 0
-            while s:
-                try:
-                    obj, end = decoder.raw_decode(s, idx)
-                except ValueError:
-                    break
-                raw = s[idx:end].strip()
-                if raw and self.on_recv:
-                    self.on_recv(raw)
-                s = s[end:].lstrip()
-                idx = 0
-            return text[:consumed_prefix] + s
-    
-    def send_data(self, msg: str):
-        try: self.sock.sendall(msg.encode("utf-8")+b"\n")
-        except Exception as e: print("[TCP] 发送失败:", e)
-    def close(self):
-        try: self.sock.shutdown(socket.SHUT_RDWR)
-        except Exception: pass
-        finally: self.sock.close()
+
+def start_modbus_server(host: str, port: int, model: ModbusRegisterModel, on_write=None):
+    server = ModbusTCPServer(host, port, model, on_write=on_write)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[MODBUS] listen on {host}:{port}")
+    return server
 
 def _side_lengths(pts: np.ndarray):
     pts = pts.reshape(-1, 2)
     return [np.linalg.norm(pts[(i+1)%len(pts)]-pts[i]) for i in range(len(pts))]
+
+def _is_right_angle_quad(pts: np.ndarray, tolerance: float = 0.2) -> bool:
+    pts = pts.reshape(-1, 2)
+    if len(pts) != 4:
+        return False
+    for i in range(4):
+        v1 = pts[(i + 1) % 4] - pts[i]
+        v2 = pts[(i - 1) % 4] - pts[i]
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-5 or n2 < 1e-5:
+            return False
+        cosang = abs(np.dot(v1, v2) / (n1 * n2 + 1e-5))
+        if cosang > tolerance:
+            return False
+    return True
+
+def _quad_aspect_ratio(poly: np.ndarray) -> Optional[float]:
+    rect = cv2.minAreaRect(poly)
+    w, h = rect[1]
+    if w <= 1e-5 or h <= 1e-5:
+        return None
+    return max(w, h) / (min(w, h) + 1e-5)
 
 def classify_contour(cnt, circularity: float):
     peri = cv2.arcLength(cnt, True)
@@ -323,13 +448,15 @@ def classify_contour(cnt, circularity: float):
         if max(sides)/(min(sides)+1e-5) <= 1.20:
             return "triangle"
     elif verts == 4:
-        x,y,w,h = cv2.boundingRect(poly)
-        ar = w / float(h+1e-5)
-        if 0.85 <= ar <= 1.15:
-            pts = poly.reshape(-1,2)
-            v1 = pts[1]-pts[0]; v2=pts[2]-pts[1]
-            cosang = abs(np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)+1e-5))
-            if cosang <= 0.15: return "rect"
+        if not _is_right_angle_quad(poly):
+            return None
+        aspect = _quad_aspect_ratio(poly)
+        if aspect is None:
+            return None
+        if aspect <= 1.2:
+            return "rect"
+        if 1.25 <= aspect <= 1.6:
+            return "rect_long"
     elif circularity > 0.75:
         return "circle"
     return None
@@ -391,186 +518,384 @@ def detect_shapes(frame_bgr: np.ndarray, color_cfgs: List['ColorCfg'], enabled_g
             labels.append((label_txt, tpos, qcolor))
     return labels
 
-def _get_i32(cam, key):
-    st = MVCC_INTVALUE()
-    if cam.MV_CC_GetIntValue(key, st) != 0: raise RuntimeError(f"Get {key} 失败")
-    return st.nCurValue
-
-def _get_enum(cam, key):
-    st = MVCC_ENUMVALUE()
-    if cam.MV_CC_GetEnumValue(key, st) != 0: raise RuntimeError(f"Get {key} 失败")
-    return st.nCurValue
-
-def _set_int(cam, key, val):
-    try: return cam.MV_CC_SetIntValue(key, int(val))
-    except Exception: return -1
-
-def _set_float(cam, key, val):
-    try: return cam.MV_CC_SetFloatValue(key, float(val))
-    except Exception: return -1
-
-def _set_enum(cam, key, val):
-    try: return cam.MV_CC_SetEnumValue(key, int(val))
-    except Exception: return -1
-
-def open_first_gige():
-    dev_list = MV_CC_DEVICE_INFO_LIST()
-    if MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE_SAFE, dev_list) != 0 or dev_list.nDeviceNum == 0:
-        raise RuntimeError("未发现 GigE 相机")
-    cam = MvCamera()
-    dev_info = ctypes.cast(dev_list.pDeviceInfo[0], ctypes.POINTER(MV_CC_DEVICE_INFO)).contents
-    if cam.MV_CC_CreateHandle(dev_info) != 0:
-        raise RuntimeError("CreateHandle 失败")
-    if cam.MV_CC_OpenDevice(MV_ACCESS_EXCLUSIVE, 0) != 0:
-        cam.MV_CC_DestroyHandle(); raise RuntimeError("OpenDevice 失败")
-
-    cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF_SAFE)
-    try:
-        cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
-        _set_float(cam, "AcquisitionFrameRate", CAMERA_INIT_FPS)
-    except Exception:
-        pass
-    try:
-        _set_int(cam, "GevSCPD", GIGE_PACKET_DELAY)
-        _set_int(cam, "GevSCPBandwidth", CAM_THROUGHPUT_MBPS*1024*1024)
-    except Exception:
-        pass
-    return cam
-
-def _reshape_with_stride(raw_view, h, w, pix_type, nbytes):
-    arr = np.frombuffer(raw_view, dtype=np.uint8)[:nbytes]
-    return arr
-
-_BAYER_CODE = {
-    PixelType_Gvsp_BayerRG8: cv2.COLOR_BayerRG2BGR,
-    PixelType_Gvsp_BayerBG8: cv2.COLOR_BayerBG2BGR,
-    PixelType_Gvsp_BayerGB8: cv2.COLOR_BayerGB2BGR,
-    PixelType_Gvsp_BayerGR8: cv2.COLOR_BayerGR2BGR,
-}
-
-def _shift_bayer_tag(base_tag, ox, oy):
-    lut = {
-        PixelType_Gvsp_BayerRG8: (PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerBG8),
-        PixelType_Gvsp_BayerGR8: (PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerBG8, PixelType_Gvsp_BayerGB8),
-        PixelType_Gvsp_BayerGB8: (PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerBG8, PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerGR8),
-        PixelType_Gvsp_BayerBG8: (PixelType_Gvsp_BayerBG8, PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerGR8, PixelType_Gvsp_BayerRG8),
-    }
-    idx = ((oy & 1) << 1) | (ox & 1)
-    return lut.get(base_tag, (base_tag,)*4)[idx]
-
 class HikGrabber(QtCore.QThread):
     frameSignal = QtCore.pyqtSignal(np.ndarray)
-    infoSignal  = QtCore.pyqtSignal(str)
+    infoSignal = QtCore.pyqtSignal(str)
+    errorSignal = QtCore.pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.cam = None
+        if not HIK_SDK_AVAILABLE or MvCamera is None:
+            reason = str(HIK_SDK_IMPORT_ERROR) if HIK_SDK_IMPORT_ERROR else "未检测到海康 SDK"
+            raise RuntimeError(f"海康 SDK 未就绪: {reason}")
+        self.camera: Optional['MvCamera'] = None
+        self._running = False
+        self._data_buf = None
+        self._data_ptr = None
+        self._convert_buf = None
+        self._convert_ptr = None
+        self._convert_buf_size = 0
+        self._payload_size = 0
+        self._last_emit_ts = 0.0
+        self._local_ip_int = self._ip_to_uint(get_local_ip())
+        self._bayer_types = {
+            PixelType_Gvsp_BayerRG8,
+            PixelType_Gvsp_BayerBG8,
+            PixelType_Gvsp_BayerGB8,
+            PixelType_Gvsp_BayerGR8,
+        }
+        self._last_stream_error = 0
+        self._last_convert_error = 0
+        self._last_unsupported_pixel = 0
+
+    @staticmethod
+    def _ip_to_uint(ip: str) -> Optional[int]:
+        try:
+            return struct.unpack(">I", socket.inet_aton(ip))[0]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _uint_to_ip(value: int) -> str:
+        try:
+            return socket.inet_ntoa(struct.pack(">I", value))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _decode_text(buf) -> str:
+        try:
+            raw = bytes(bytearray(buf))
+        except Exception:
+            return ""
+        raw = raw.split(b"\0", 1)[0]
+        try:
+            return raw.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+
+    def _is_same_lan(self, info) -> bool:
+        if not self._local_ip_int:
+            return False
+        try:
+            gige = info.SpecialInfo.stGigEInfo
+            cam_ip = int(gige.nCurrentIp)
+            mask = int(gige.nCurrentSubNetMask) or 0xFFFFFFFF
+            return (self._local_ip_int & mask) == (cam_ip & mask)
+        except Exception:
+            return False
+
+    def _format_device_name(self, info) -> str:
+        try:
+            gige = info.SpecialInfo.stGigEInfo
+            name = self._decode_text(gige.chUserDefinedName) or self._decode_text(gige.chModelName)
+            ip = self._uint_to_ip(int(gige.nCurrentIp))
+            if name and ip:
+                return f"{name} ({ip})"
+            if ip:
+                return f"Hik GIGE ({ip})"
+            return name or "Hik GIGE"
+        except Exception:
+            return "Hik GIGE"
+
+    def _select_device(self):
+        dev_list = MV_CC_DEVICE_INFO_LIST()
+        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
+        if ret != MV_OK:
+            raise RuntimeError(f"枚举海康相机失败: 0x{ret:08X}")
+        if dev_list.nDeviceNum == 0:
+            return None
+        accessible_candidates = []
+        for idx in range(int(dev_list.nDeviceNum)):
+            ptr = dev_list.pDeviceInfo[idx]
+            if not ptr:
+                continue
+            info_copy = MV_CC_DEVICE_INFO()
+            ctypes.memmove(
+                byref(info_copy),
+                ctypes.byref(ptr.contents),
+                ctypes.sizeof(MV_CC_DEVICE_INFO),
+            )
+            if not MvCamera.MV_CC_IsDeviceAccessible(info_copy, MV_ACCESS_Exclusive):
+                continue
+            display = self._format_device_name(info_copy)
+            if self._is_same_lan(info_copy):
+                return info_copy, display
+            accessible_candidates.append((info_copy, display))
+        if accessible_candidates:
+            return accessible_candidates[0]
+        return None
+
+    def _prepare_payload(self):
+        payload = MVCC_INTVALUE()
+        ret = self.camera.MV_CC_GetIntValue("PayloadSize", payload)
+        if ret != MV_OK or int(payload.nCurValue) <= 0:
+            raise RuntimeError(f"获取 PayloadSize 失败: 0x{ret:08X}")
+        self._payload_size = int(payload.nCurValue)
+        self._data_buf = (c_ubyte * self._payload_size)()
+        self._data_ptr = cast(self._data_buf, POINTER(c_ubyte))
+
+    def _get_int_value(self, key: str) -> Optional[int]:
+        if not self.camera:
+            return None
+        value = MVCC_INTVALUE()
+        ret = self.camera.MV_CC_GetIntValue(key, value)
+        if ret == MV_OK:
+            return int(value.nCurValue)
+        return None
+
+    def _ensure_convert_buffer(self, size: int):
+        if self._convert_buf_size < size:
+            self._convert_buf = (c_ubyte * size)()
+            self._convert_ptr = cast(self._convert_buf, POINTER(c_ubyte))
+            self._convert_buf_size = size
+
+    def _convert_frame(self, frame_info: 'MV_FRAME_OUT_INFO_EX') -> Optional[np.ndarray]:
+        width = int(frame_info.nWidth)
+        height = int(frame_info.nHeight)
+        frame_len = int(frame_info.nFrameLen)
+        pixel_type = int(frame_info.enPixelType)
+        if frame_len <= 0 or width <= 0 or height <= 0:
+            return None
+        if pixel_type == PixelType_Gvsp_BGR8_Packed:
+            arr = np.frombuffer(self._data_buf, dtype=np.uint8, count=frame_len)
+            return arr.reshape(height, width, 3).copy()
+        if pixel_type == PixelType_Gvsp_RGB8_Packed:
+            arr = np.frombuffer(self._data_buf, dtype=np.uint8, count=frame_len)
+            rgb = arr.reshape(height, width, 3)
+            return rgb[:, :, ::-1].copy()
+        if pixel_type == PixelType_Gvsp_Mono8:
+            arr = np.frombuffer(self._data_buf, dtype=np.uint8, count=frame_len)
+            gray = arr.reshape(height, width)
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        if pixel_type in self._bayer_types or pixel_type in {PixelType_Gvsp_YUV422_Packed, PixelType_Gvsp_YUV422_YUYV_Packed}:
+            dst_size = width * height * 3
+            self._ensure_convert_buffer(dst_size)
+            convert_param = MV_CC_PIXEL_CONVERT_PARAM()
+            convert_param.nWidth = width
+            convert_param.nHeight = height
+            convert_param.enSrcPixelType = pixel_type
+            convert_param.pSrcData = self._data_ptr
+            convert_param.nSrcDataLen = frame_len
+            convert_param.enDstPixelType = PixelType_Gvsp_BGR8_Packed
+            convert_param.pDstBuffer = self._convert_ptr
+            convert_param.nDstBufferSize = dst_size
+            convert_param.nDstLen = dst_size
+            ret = self.camera.MV_CC_ConvertPixelType(convert_param)
+            if ret != MV_OK:
+                if self._last_convert_error != ret:
+                    self.infoSignal.emit(f"[HIK] 像素转换失败: 0x{ret:08X}")
+                    self._last_convert_error = ret
+                return None
+            self._last_convert_error = 0
+            arr = np.frombuffer(self._convert_buf, dtype=np.uint8, count=dst_size)
+            return arr.reshape(height, width, 3).copy()
+        if self._last_unsupported_pixel != pixel_type:
+            self.infoSignal.emit(f"[HIK] 不支持的像素格式: 0x{pixel_type:08X}")
+            self._last_unsupported_pixel = pixel_type
+        return None
+
+    def _cleanup_camera(self):
+        if self.camera:
+            try:
+                self.camera.MV_CC_StopGrabbing()
+            except Exception:
+                pass
+            try:
+                self.camera.MV_CC_CloseDevice()
+            except Exception:
+                pass
+            try:
+                self.camera.MV_CC_DestroyHandle()
+            except Exception:
+                pass
+            self.camera = None
+        self._data_buf = None
+        self._data_ptr = None
+        self._convert_buf = None
+        self._convert_ptr = None
+        self._convert_buf_size = 0
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        initialized = False
+        try:
+            ret = MvCamera.MV_CC_Initialize()
+            if ret != MV_OK:
+                raise RuntimeError(f"初始化海康 SDK 失败: 0x{ret:08X}")
+            initialized = True
+            selection = self._select_device()
+            if not selection:
+                raise RuntimeError("未发现可用的海康相机")
+            device_info, display_name = selection
+            self.camera = MvCamera()
+            ret = self.camera.MV_CC_CreateHandle(device_info)
+            if ret != MV_OK:
+                raise RuntimeError(f"创建相机句柄失败: 0x{ret:08X}")
+            ret = self.camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+            if ret != MV_OK:
+                raise RuntimeError(f"打开相机失败: 0x{ret:08X}")
+            self._prepare_payload()
+            ret = self.camera.MV_CC_StartGrabbing()
+            if ret != MV_OK:
+                raise RuntimeError(f"启动取流失败: 0x{ret:08X}")
+            width = self._get_int_value("Width")
+            height = self._get_int_value("Height")
+            if width and height:
+                self.infoSignal.emit(f"[INFO] {display_name} {width}x{height}")
+            else:
+                self.infoSignal.emit(f"[INFO] {display_name}")
+            self._running = True
+            frame_info = MV_FRAME_OUT_INFO_EX()
+            grabbed = 0
+            last_fps_ts = time.time()
+            self._last_emit_ts = 0.0
+            while self._running:
+                ret = self.camera.MV_CC_GetOneFrameTimeout(self._data_ptr, self._payload_size, frame_info, 1000)
+                if ret != MV_OK:
+                    if ret != self._last_stream_error:
+                        self.infoSignal.emit(f"[HIK] 取流异常: 0x{ret:08X}")
+                        self._last_stream_error = ret
+                    continue
+                self._last_stream_error = 0
+                now = time.time()
+                grabbed += 1
+                if (now - self._last_emit_ts) < (1.0 / UI_TARGET_FPS):
+                    if (now - last_fps_ts) >= 1.0:
+                        fps = grabbed / (now - last_fps_ts)
+                        self.infoSignal.emit(f"[FPS] {fps:.1f}")
+                        grabbed = 0
+                        last_fps_ts = now
+                    continue
+                frame = self._convert_frame(frame_info)
+                if frame is None:
+                    continue
+                self._last_emit_ts = now
+                self.frameSignal.emit(frame)
+                if (now - last_fps_ts) >= 1.0:
+                    fps = grabbed / (now - last_fps_ts)
+                    self.infoSignal.emit(f"[FPS] {fps:.1f}")
+                    grabbed = 0
+                    last_fps_ts = now
+                QtCore.QThread.msleep(1)
+        except Exception as exc:
+            self._running = False
+            self.infoSignal.emit(f"[HIK] {exc}")
+            self.errorSignal.emit(str(exc))
+        finally:
+            self._cleanup_camera()
+            if initialized:
+                try:
+                    MvCamera.MV_CC_Finalize()
+                except Exception:
+                    pass
+
+
+class UsbGrabber(QtCore.QThread):
+    frameSignal = QtCore.pyqtSignal(np.ndarray)
+    infoSignal  = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None, index: int = 0):
+        super().__init__(parent)
+        self.index = index
+        self.cap: Optional[cv2.VideoCapture] = None
         self._running = False
         self._last_emit_ts = 0.0
+
     def run(self):
         try:
-            self.cam = open_first_gige()
-            width  = _get_i32(self.cam, "Width")
-            height = _get_i32(self.cam, "Height")
-            pix    = _get_enum(self.cam, "PixelFormat")
-            self.infoSignal.emit(f"[INFO] {width}x{height}")  # 不显示 PixelFormat
-            if self.cam.MV_CC_StartGrabbing() != 0:
-                raise RuntimeError("StartGrabbing 失败")
-            pl = MVCC_INTVALUE(); self.cam.MV_CC_GetIntValue("PayloadSize", pl)
-            in_size = int(pl.nCurValue if pl.nCurValue > 0 else width*height*3)
-            buf = (ctypes.c_ubyte * in_size)()
-            frame_info = MV_FRAME_OUT_INFO_EX()
+            if os.name == "nt":
+                backend = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+            else:
+                backend = cv2.CAP_ANY
+            self.cap = cv2.VideoCapture(self.index, backend)
+            if (not self.cap or not self.cap.isOpened()) and backend != cv2.CAP_ANY:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = cv2.VideoCapture(self.index)
+            if not self.cap or not self.cap.isOpened():
+                raise RuntimeError("无法打开 USB 摄像头")
+
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if width > 0 and height > 0:
+                self.infoSignal.emit(f"[INFO] {width}x{height}")
+            else:
+                self.infoSignal.emit("[INFO] USB Camera")
+
             self._running = True
-            t0 = time.time(); grabbed = 0
+            t0 = time.time()
+            grabbed = 0
             while self._running:
-                nret = self.cam.MV_CC_GetOneFrameTimeout(buf, in_size, frame_info, 1000)
-                if nret != 0: continue
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    QtCore.QThread.msleep(5)
+                    continue
                 grabbed += 1
-                w, h = frame_info.nWidth, frame_info.nHeight
-                raw = memoryview(buf)[:frame_info.nFrameLen]
-                pt  = frame_info.enPixelType
-                # 1) SDK 转 BGR8
-                out_size = w*h*3
-                out_buf  = (ctypes.c_ubyte * out_size)()
-                cvt = MV_CC_PIXEL_CONVERT_PARAM()
-                cvt.nWidth  = w; cvt.nHeight = h
-                cvt.enSrcPixelType = pt
-                cvt.enDstPixelType = PixelType_Gvsp_BGR8_Packed
-                cvt.pSrcData = buf
-                cvt.nSrcDataLen = frame_info.nFrameLen
-                cvt.pDstBuffer = out_buf
-                cvt.nDstBufferSize = out_size
-                ret2 = self.cam.MV_CC_ConvertPixelType(cvt)
-                if ret2 == 0:
-                    img = np.frombuffer(out_buf, dtype=np.uint8)[: out_size].reshape(h, w, 3)
-                else:
-                    plane = _reshape_with_stride(raw, h, w, pt, frame_info.nFrameLen)
-                    if pt == PixelType_Gvsp_Mono8:
-                        gray = plane.reshape(h, w)
-                        img  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                    elif pt in (PixelType_Gvsp_BayerRG8, PixelType_Gvsp_BayerBG8,
-                                PixelType_Gvsp_BayerGB8, PixelType_Gvsp_BayerGR8):
-                        base = pt
-                        try:
-                            ox = _get_i32(self.cam, "OffsetX")
-                            oy = _get_i32(self.cam, "OffsetY")
-                        except Exception:
-                            ox = oy = 0
-                        tag = _shift_bayer_tag(base, ox, oy)
-                        bayer = plane.reshape(h, w)
-                        img   = cv2.cvtColor(bayer, _BAYER_CODE.get(tag, cv2.COLOR_BayerRG2BGR))
-                    elif pt == PixelType_Gvsp_RGB8_Packed:
-                        rgb = plane.reshape(h, w, 3)
-                        img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                    elif pt == PixelType_Gvsp_BGR8_Packed:
-                        img = plane.reshape(h, w, 3)
-                    else:
-                        gray = plane.reshape(h, -1)[:, :w]
-                        img  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                if img.shape[1] > TARGET_DISPLAY_WIDTH:
-                    scale = TARGET_DISPLAY_WIDTH / float(img.shape[1])
-                    img = cv2.resize(img, (TARGET_DISPLAY_WIDTH, int(img.shape[0]*scale)), interpolation=cv2.INTER_AREA)
+                if frame.shape[1] > TARGET_DISPLAY_WIDTH:
+                    scale = TARGET_DISPLAY_WIDTH / float(frame.shape[1])
+                    frame = cv2.resize(frame, (TARGET_DISPLAY_WIDTH, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+
                 now_ts = time.time()
                 if (now_ts - self._last_emit_ts) < (1.0 / UI_TARGET_FPS):
+                    QtCore.QThread.msleep(5)
                     continue
+
                 self._last_emit_ts = now_ts
-                self.frameSignal.emit(img)
+                self.frameSignal.emit(frame.copy())
+
                 now = time.time()
                 if now - t0 >= 1.0:
-                    self.infoSignal.emit(f"[FPS] {grabbed/(now-t0):.1f}")
-                    t0 = now; grabbed = 0
+                    self.infoSignal.emit(f"[FPS] {grabbed / (now - t0):.1f}")
+                    t0 = now
+                    grabbed = 0
+
+                QtCore.QThread.msleep(1)
         except Exception as e:
-            self.infoSignal.emit(f"[HIK] 取流异常: {e}")
+            self.infoSignal.emit(f"[USB] 取流异常: {e}")
         finally:
             self._stop_and_close()
-    def stop(self): self._running = False
+
+    def stop(self):
+        self._running = False
+
     def _stop_and_close(self):
-        try:
-            if self.cam:
-                try: self.cam.MV_CC_StopGrabbing()
-                except Exception: pass
-                try: self.cam.MV_CC_CloseDevice()
-                except Exception: pass
-                try: self.cam.MV_CC_DestroyHandle()
-                except Exception: pass
-        finally:
-            self.cam = None
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = None
 
 class MainWindow(QtWidgets.QWidget):
-    tcp_msg_sig = QtCore.pyqtSignal(str)
+    modbus_trigger_sig = QtCore.pyqtSignal()
     def __init__(self, config: dict):
         super().__init__(None, QtCore.Qt.Window)
         self.setWindowTitle(APP_TITLE); self.resize(1200, 720)
         self.config = config
-        self.cmd_map = dict(self.config.get("cmd_map", {}))
+        self.result_codes = result_codes_from_cmd_map(self.config.get("cmd_map", {}))
         self.colors = {c.name: c for c in colors_from_config(self.config)}
         self.mask_windows: Dict[str, MaskWindow] = {}
-        self._running = True
         self.frame_cnt = 0
         self.fps = 0.0
         self.last_time = time.time()
-        self.tcp_sender = None
         self.last_frame_bgr: np.ndarray | None = None
         self._last_paint_ts = 0.0
+
+        svr = self.config.get("server", {})
+        self.modbus_host = str(svr.get("host", "0.0.0.0") or "0.0.0.0")
+        self.modbus_port = int(svr.get("port", 502))
+        self.modbus_model = ModbusRegisterModel(size=16)
+        self.modbus_server = None
+        self.modbus_error: str | None = None
+        self._modbus_shutdown_event: Optional[threading.Event] = None
+        self._last_result_count = 0
+        self._start_modbus_server(self.modbus_host)
+        self.modbus_trigger_sig.connect(self._on_modbus_trigger)
 
         hbox = QtWidgets.QHBoxLayout(self)
         self.ctrl_panel = QtWidgets.QFrame(); self.ctrl_panel.setFixedWidth(340)
@@ -624,19 +949,10 @@ class MainWindow(QtWidgets.QWidget):
         self.msg_timer.timeout.connect(lambda: self.msg_label.setText(""))
 
         self._init_controls()
+        self._update_modbus_status()
 
-        svr = self.config.get("server", {})
-        self.ip_input.setText(str(svr.get("host", "127.0.0.1")))
-        self.port_input.setText(str(svr.get("port", 6000)))
-        print(f"[配置] 默认服务器: {self.ip_input.text()}:{self.port_input.text()}")
-
-        self.grabber = HikGrabber(self)
-        self.grabber.frameSignal.connect(self.on_frame_from_hik)
-        self.grabber.infoSignal.connect(self.on_info)
-        self.grabber.start()
-
-        self.svr = start_server(on_message=self.handle_tcp_msg)
-        self.tcp_msg_sig.connect(self._process_tcp_msg)
+        self.grabber: Optional[QtCore.QThread] = None
+        self._start_camera()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
@@ -652,19 +968,158 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_stop.clicked.connect(self.stop_camera)
         lay.addWidget(self.btn_reopen); lay.addWidget(self.btn_stop); vbox.addWidget(g_cam)
 
-        for cfg in self.colors.values(): self._add_color_group(vbox, cfg)
+        for cfg in self.colors.values():
+            self._add_color_group(vbox, cfg)
 
-        g_tcp = QtWidgets.QGroupBox("设置"); tl = QtWidgets.QVBoxLayout(g_tcp)
-        tl.addWidget(QtWidgets.QLabel("IP:")); self.ip_input = QtWidgets.QLineEdit("127.0.0.1"); tl.addWidget(self.ip_input)
-        tl.addWidget(QtWidgets.QLabel("端口:")); self.port_input = QtWidgets.QLineEdit("6000"); tl.addWidget(self.port_input)
-        tl.addWidget(QtWidgets.QLabel("内容:")); self.cmd_input = QtWidgets.QLineEdit(""); tl.addWidget(self.cmd_input)
-        hl = QtWidgets.QHBoxLayout()
-        self.connect_btn = QtWidgets.QPushButton("连接"); self.connect_btn.clicked.connect(self.connect_tcp)
-        self.send_btn    = QtWidgets.QPushButton("发送"); self.send_btn.clicked.connect(self.test_send)
-        self.recognize_btn = QtWidgets.QPushButton("识别"); self.recognize_btn.clicked.connect(self.recognize_once)
-        for b in (self.connect_btn, self.send_btn, self.recognize_btn): hl.addWidget(b)
-        tl.addLayout(hl); vbox.addWidget(g_tcp)
+        g_modbus = QtWidgets.QGroupBox("Modbus")
+        form = QtWidgets.QFormLayout(g_modbus)
+        self.modbus_ip_combo = QtWidgets.QComboBox()
+        self.modbus_ip_combo.currentIndexChanged.connect(self._on_modbus_ip_changed)
+        self.modbus_port_label = QtWidgets.QLabel(str(self.modbus_port))
+        self.modbus_status_lbl = QtWidgets.QLabel("")
+        form.addRow("服务器IP:", self.modbus_ip_combo)
+        form.addRow("端口:", self.modbus_port_label)
+        form.addRow("状态:", self.modbus_status_lbl)
+        self.recognize_btn = QtWidgets.QPushButton("手动识别")
+        self.recognize_btn.clicked.connect(self.trigger_manual_recognition)
+        form.addRow(self.recognize_btn)
+        vbox.addWidget(g_modbus)
         vbox.addStretch(1)
+
+        self._ip_choices: List[str] = []
+        self._refresh_modbus_ip()
+        self.ip_refresh_timer = QtCore.QTimer(self)
+        self.ip_refresh_timer.setInterval(2000)
+        self.ip_refresh_timer.timeout.connect(self._refresh_modbus_ip)
+        self.ip_refresh_timer.start()
+
+    def _start_camera(self, prefer_hik: bool = True):
+        self.stop_camera()
+        if prefer_hik:
+            try:
+                grabber = HikGrabber(self)
+            except Exception as exc:
+                print(f"[HIK] {exc}")
+            else:
+                self.grabber = grabber
+                grabber.frameSignal.connect(self.on_frame_from_hik)
+                grabber.infoSignal.connect(self.on_info)
+                grabber.errorSignal.connect(self._on_hik_error)
+                grabber.start()
+                return
+        self.grabber = UsbGrabber(self)
+        self.grabber.frameSignal.connect(self.on_frame_from_hik)
+        self.grabber.infoSignal.connect(self.on_info)
+        self.grabber.start()
+
+    def _update_modbus_status(self):
+        if self.modbus_server:
+            status = "运行"
+        elif getattr(self, "modbus_error", None):
+            status = f"未启动: {self.modbus_error}"
+        else:
+            status = "未启动"
+        if hasattr(self, "modbus_status_lbl"):
+            self.modbus_status_lbl.setText(status)
+
+    def _refresh_modbus_ip(self):
+        if not hasattr(self, "modbus_ip_combo"):
+            return
+
+        entries = list_local_ipv4_addresses()
+        ips = [ip for ip, _ in entries]
+
+        if "0.0.0.0" not in ips:
+            ips.insert(0, "0.0.0.0")
+            entries.insert(0, ("0.0.0.0", "全部网口"))
+
+        if self.modbus_host not in ips:
+            entries.append((self.modbus_host, "当前"))
+            ips.append(self.modbus_host)
+
+        if ips != self._ip_choices:
+            blocker = QtCore.QSignalBlocker(self.modbus_ip_combo)
+            self.modbus_ip_combo.clear()
+            for ip, iface in entries:
+                if ip == "0.0.0.0":
+                    text = f"{ip} (全部网口)"
+                elif iface:
+                    text = f"{ip} ({iface})"
+                else:
+                    text = ip
+                self.modbus_ip_combo.addItem(text, ip)
+            self._ip_choices = ips
+            del blocker
+
+        current_idx = self.modbus_ip_combo.findData(self.modbus_host)
+        if current_idx < 0:
+            current_idx = 0
+        if self.modbus_ip_combo.currentIndex() != current_idx:
+            blocker = QtCore.QSignalBlocker(self.modbus_ip_combo)
+            self.modbus_ip_combo.setCurrentIndex(current_idx)
+            del blocker
+
+    def _on_modbus_ip_changed(self, index: int):
+        if index < 0:
+            return
+        data = self.modbus_ip_combo.itemData(index)
+        if not data:
+            data = self.modbus_ip_combo.itemText(index)
+        host = str(data)
+        if host and host != self.modbus_host:
+            self._start_modbus_server(host)
+
+    def _stop_modbus_server(self):
+        server = getattr(self, "modbus_server", None)
+        if not server:
+            self._modbus_shutdown_event = None
+            return
+        self.modbus_server = None
+        done = threading.Event()
+
+        def do_shutdown():
+            try:
+                server.shutdown()
+            except Exception as exc:
+                print(f"[MODBUS] 停止异常: {exc}")
+            finally:
+                try:
+                    server.server_close()
+                except Exception as exc:
+                    print(f"[MODBUS] 关闭异常: {exc}")
+                done.set()
+
+        threading.Thread(target=do_shutdown, daemon=True).start()
+        self._modbus_shutdown_event = done
+        return done
+
+    def _start_modbus_server(self, host: Optional[str] = None):
+        if host is not None:
+            self.modbus_host = host
+
+        shutdown_event = self._stop_modbus_server()
+        if shutdown_event is not None:
+            if not shutdown_event.wait(timeout=1.0):
+                print("[MODBUS] 等待旧连接关闭超时，继续启动新服务器")
+            self._modbus_shutdown_event = None
+        self.modbus_error = None
+
+        try:
+            self.modbus_server = start_modbus_server(
+                self.modbus_host, self.modbus_port, self.modbus_model, on_write=self._on_modbus_write
+            )
+        except Exception as exc:
+            print(f"[MODBUS] 启动失败: {exc}")
+            self.modbus_server = None
+            self.modbus_error = str(exc)
+
+        self.config.setdefault("server", {})
+        self.config["server"]["host"] = self.modbus_host
+        self.config["server"]["port"] = self.modbus_port
+
+        self._update_modbus_status()
+        if hasattr(self, "modbus_ip_combo"):
+            self._refresh_modbus_ip()
 
     def _add_color_group(self, parent_layout, cfg: ColorCfg):
         g = QtWidgets.QGroupBox(cfg.group_title); g.setCheckable(True); g.setChecked(False); g.setFlat(True)
@@ -687,7 +1142,7 @@ class MainWindow(QtWidgets.QWidget):
         # 每色的形状开关（按 JSON 默认勾选）
         shape_box = QtWidgets.QGroupBox("")
         shape_lay = QtWidgets.QHBoxLayout(shape_box); shape_lay.setContentsMargins(6,4,6,4)
-        for key, text in (("circle","圆形"), ("triangle","三角形"), ("rect","正方形")):
+        for key, text in (("circle","圆形"), ("triangle","三角形"), ("rect","正方形"), ("rect_long", "长方形")):
             cb = QtWidgets.QCheckBox(text)
             cb.setChecked(bool(cfg.shapes_init.get(key, True)))
             shape_lay.addWidget(cb)
@@ -701,50 +1156,60 @@ class MainWindow(QtWidgets.QWidget):
         lv = cfg.sliders[f"{cfg.name}_minV"].value(); uv = cfg.sliders[f"{cfg.name}_maxV"].value()
         cfg.lower[:] = [lh, ls, lv]; cfg.upper[:] = [uh, us, uv]
 
-    def reopen_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-        self.grabber = HikGrabber(self)
-        self.grabber.frameSignal.connect(self.on_frame_from_hik)
-        self.grabber.infoSignal.connect(self.on_info)
-        self.grabber.start()
-    def stop_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-
-    def connect_tcp(self):
-        ip = self.ip_input.text().strip()
-        port = int(self.port_input.text())
-        try:
-            self.tcp_sender = TcpSender(ip, port, on_recv=self.handle_tcp_msg)
-            QtWidgets.QMessageBox.information(self, "成功", f"已连接 {ip}:{port}")
-            self.start_heartbeat()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", f"连接失败: {e}")
-    def test_send(self):
-        if not self.tcp_sender:
-            QtWidgets.QMessageBox.warning(self, "警告", "请先连接TCP服务器"); return
-        msg = self.cmd_input.text()
-        if msg.strip(): self.tcp_sender.send_data(msg)
-    def start_heartbeat(self, interval: int = 10):
-        if getattr(self, "_hb_thread", None): return
-        def loop():
-            while self._running:
-                if self.tcp_sender:
-                    hb = {"dsID": HEARTBEAT_DS_ID, "reqType": "heartbeat"}
-                    self.tcp_sender.send_data(json.dumps(hb, ensure_ascii=False))
-                time.sleep(interval)
-        self._hb_thread = threading.Thread(target=loop, daemon=True); self._hb_thread.start()
-    def handle_tcp_msg(self, text: str): self.tcp_msg_sig.emit(text)
     @QtCore.pyqtSlot(str)
-    def _process_tcp_msg(self, text: str):
-        try: cmd = json.loads(text)
-        except Exception as e:
-            print(f"[协议] 非法 JSON: {e}"); return
-        if cmd.get("reqType") == "photo":
-            self.recognize_once()
-            if self.tcp_sender:
-                self.tcp_sender.send_data(json.dumps({"dsID":HEARTBEAT_DS_ID,"reqType":"photo","ret":1}, ensure_ascii=False))
+    def _on_hik_error(self, message: str):
+        print(f"[HIK] {message}")
+        if isinstance(getattr(self, "grabber", None), HikGrabber):
+            self.stop_camera()
+            self._start_camera(prefer_hik=False)
+
+    def reopen_camera(self):
+        self._start_camera(prefer_hik=True)
+
+    def stop_camera(self):
+        grabber = getattr(self, "grabber", None)
+        if grabber and grabber.isRunning():
+            grabber.stop(); grabber.wait(1000)
+        self.grabber = None
+
+    def _on_modbus_write(self, addr: int, value: int):
+        if addr == 0 and value == 1:
+            print("[MODBUS] 收到拍照请求")
+            self.modbus_trigger_sig.emit()
+
+    def _handle_recognition_request(self, manual: bool = False):
+        model = getattr(self, "modbus_model", None)
+        if model:
+            if manual:
+                model.set_register(0, 1)
+            self._publish_modbus_result([])
+        self.recognize_once()
+        if model:
+            model.set_register(0, 0)
+
+    @QtCore.pyqtSlot()
+    def _on_modbus_trigger(self):
+        self._handle_recognition_request(manual=False)
+
+    @QtCore.pyqtSlot()
+    def trigger_manual_recognition(self):
+        self._handle_recognition_request(manual=True)
+
+    def _publish_modbus_result(self, values):
+        model = getattr(self, "modbus_model", None)
+        if not model:
+            return
+        if isinstance(values, int):
+            values_list = [values]
+        else:
+            values_list = list(values)
+        if not values_list:
+            values_list = [0]
+        sanitized = [int(v) & 0xFFFF for v in values_list]
+        if self._last_result_count > len(sanitized):
+            sanitized.extend([0] * (self._last_result_count - len(sanitized)))
+        model.write(RESULT_BASE_ADDR, sanitized)
+        self._last_result_count = len(sanitized)
 
     @QtCore.pyqtSlot(np.ndarray)
     def on_frame_from_hik(self, frame_bgr: np.ndarray):
@@ -754,7 +1219,7 @@ class MainWindow(QtWidgets.QWidget):
         self._last_paint_ts = t
         self.last_frame_bgr = frame_bgr
         self.frame_cnt += 1
-        enabled_global = {"circle", "triangle", "rect"}
+        enabled_global = {"circle", "triangle", "rect", "rect_long"}
         frame_draw = frame_bgr.copy()
         labels = detect_shapes(frame_draw, list(self.colors.values()), enabled_global)
 
@@ -790,8 +1255,12 @@ class MainWindow(QtWidgets.QWidget):
 
     def recognize_once(self):
         if self.last_frame_bgr is None:
-            print("[识别] 当前没有画面"); return
-        enabled_global = {"circle", "triangle", "rect"}
+            print("[识别] 当前没有画面")
+            self.msg_label.setText("未识别到目标")
+            self.msg_timer.start(2000)
+            self._publish_modbus_result(0xFF)
+            return
+        enabled_global = {"circle", "triangle", "rect", "rect_long"}
         img = self.last_frame_bgr.copy()
         labels = detect_shapes(img, list(self.colors.values()), enabled_global)
         gold_cfg = self.colors.get("金色", None)
@@ -802,13 +1271,24 @@ class MainWindow(QtWidgets.QWidget):
                 x, y, r, _ = max(cands, key=lambda t: t[3])
                 cv2.circle(img, (int(x), int(y)), int(r), (0, 215, 255), 2)
                 labels.append(("金色-圆形", (int(x - r), int(y - r - 6)), QtGui.QColor(255, 215, 0)))
+        result_values: List[int] = []
         if labels:
-            self.msg_label.setText("\n".join([t for t,_,_ in labels])); self.msg_timer.start(2000)
+            self.msg_label.setText("\n".join([t for t,_,_ in labels]))
+            self.msg_timer.start(2000)
             for text, *_ in labels:
-                if text in self.cmd_map and self.tcp_sender:
-                    self.tcp_sender.send_data(self.cmd_map[text])
+                code = self.result_codes.get(text)
+                if code is not None:
+                    result_values.append(int(code))
+            if not result_values:
+                print("[识别] 未找到匹配的结果编码，保持 0")
+                self._publish_modbus_result(0)
+            else:
+                self._publish_modbus_result(result_values)
         else:
             print("[识别] 未检测到目标")
+            self.msg_label.setText("未识别到目标")
+            self.msg_timer.start(2000)
+            self._publish_modbus_result(0xFF)
 
     def toggle_mask(self, name: str):
         if name in self.mask_windows and self.mask_windows[name].isVisible():
@@ -831,27 +1311,9 @@ class MainWindow(QtWidgets.QWidget):
         elif s.startswith("[FPS]"):
             self.lbl_fps.setText(s.replace("[FPS]","FPS").strip())
 
-    def reopen_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-        self.grabber = HikGrabber(self)
-        self.grabber.frameSignal.connect(self.on_frame_from_hik)
-        self.grabber.infoSignal.connect(self.on_info)
-        self.grabber.start()
-
-    def stop_camera(self):
-        if getattr(self, "grabber", None) and self.grabber.isRunning():
-            self.grabber.stop(); self.grabber.wait(1000)
-
     def closeEvent(self, e):
-        self._running = False
-        if getattr(self, "svr", None):
-            try: self.svr.shutdown()
-            except Exception: pass
-        if self.tcp_sender: self.tcp_sender.close(); self.tcp_sender = None
-        if getattr(self, "grabber", None):
-            try: self.grabber.stop(); self.grabber.wait(1000)
-            except Exception: pass
+        self._stop_modbus_server()
+        self.stop_camera()
         super().closeEvent(e)
 
 def main():
